@@ -1,0 +1,2 @@
+# tippy (clippy) configuration. ".." keeps the default list.
+doc-valid-idents = ["ALab", ".."]

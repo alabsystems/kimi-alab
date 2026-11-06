@@ -1,0 +1,12 @@
+kimi-alab
+Copyright 2026 Andrew Yates
+
+kimi-alab is a harness: it runs Moonshot AI's Kimi Code CLI (`kimi`, MIT licensed,
+https://github.com/MoonshotAI/kimi-code) as an unmodified child process. It does not contain,
+ship, fork or patch any Kimi Code bytes; the `kimi` it runs is the build the atpkg package
+manager installed from the vendor's own distribution. "Kimi" and "Kimi Code" are Moonshot AI's
+names, used here only to say which program the harness runs.
+
+The resume grammar and session-lock layout this harness relies on were read from Kimi Code
+2.3.1's published source (tag @moonshot-ai/kimi-code@2.3.1) and are cited file by file in
+src/kimi.rs and README.md; no Kimi Code source is copied into this repository.

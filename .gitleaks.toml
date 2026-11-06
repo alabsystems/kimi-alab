@@ -1,0 +1,10 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# Gitleaks configuration for kimi-alab: the standard rule set and nothing else. NO ALLOWLIST,
+# deliberately: the publication engine refuses every repository-controlled suppression
+# ([allowlist], per-rule allowlists, disabledRules, an external [extend] path or url) and an
+# exported .gitleaksignore. If Gitleaks flags something, fix it where it lives.
+
+[extend]
+useDefault = true
