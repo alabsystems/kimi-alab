@@ -637,6 +637,7 @@ mod tests {
 
     #[test]
     fn the_childs_lock_names_its_session() {
+        let _process = crate::proc::PROCESS_TEST_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!("kimi-alab-locks-{}", std::process::id()));
         let dir = home.join("locks/sessions");
         std::fs::create_dir_all(&dir).unwrap();

@@ -61,6 +61,16 @@ impl Env {
         Self { vars }
     }
 
+    /// Set `name` to `value` in this snapshot.
+    pub fn set(&mut self, name: &str, value: &OsStr) {
+        self.vars.insert(OsString::from(name), value.to_os_string());
+    }
+
+    /// Remove `name` from this snapshot.
+    pub fn remove(&mut self, name: &str) {
+        self.vars.remove(OsStr::new(name));
+    }
+
     /// `$HOME`, only when it is set and absolute.
     pub fn home(&self) -> Option<PathBuf> {
         self.get_nonempty("HOME")

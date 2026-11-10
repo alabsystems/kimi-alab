@@ -187,10 +187,13 @@ this terminal, passes every argument through, and exits with the child's own sta
 
 When atpkg makes a different {cmd} build current while the session runs, {NAME} waits for a
 safe point and resumes the same session on the new build (`{cmd} … --session <id>`) without
-exiting. In this version a safe point needs an idle attestation, `kill -USR1 <{NAME} pid>`,
-from something that sees the screen (the turn has ended, the composer is empty, no background
-task runs), and then {quiet} s with no keystroke read, nothing drawn, no process started or
-ended under {cmd}, and almost no CPU. A busy {cmd} is never stopped.
+exiting. A new {NAME} build crosses the same safe point by exec: the harness keeps its pid and
+the child runs on, with its session and account state carried to the new image. Under a proven
+aterm contract-3 claim (scope=relaunch,upgrade), aterm's own idle and empty-composer status
+supplies the attestation. Elsewhere `kill -USR1 <{NAME} pid>` supplies it. Both then need
+{quiet} s with no keystroke read, nothing drawn, no process started or ended under {cmd}, and
+almost no CPU. A busy {cmd} is never stopped. If aterm cannot prove the claim, {NAME} execs {cmd}
+in its place instead of leaving two supervisors.
 
 ENVIRONMENT
   KIMI_ALAB_PKG_PREFIX   the atpkg prefix (default: aterm.toml [packages] prefix, else

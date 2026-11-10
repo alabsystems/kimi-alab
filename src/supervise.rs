@@ -36,10 +36,11 @@ use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
 use signal_hook::consts::signal::{
-    SIGABRT, SIGBUS, SIGCHLD, SIGFPE, SIGHUP, SIGILL, SIGINT, SIGQUIT, SIGSEGV, SIGSYS, SIGTERM,
-    SIGTRAP, SIGTSTP, SIGUSR1, SIGUSR2,
+    SIGABRT, SIGBUS, SIGCHLD, SIGFPE, SIGHUP, SIGILL, SIGINT, SIGKILL, SIGQUIT, SIGSEGV, SIGSYS,
+    SIGTERM, SIGTRAP, SIGTSTP, SIGUSR1, SIGUSR2,
 };
 
+use crate::aterm::{self, Claimed, SafePointError};
 use crate::cli::NAME;
 use crate::env::Env;
 use crate::journal::Journal;
@@ -244,13 +245,13 @@ impl Status {
 
     /// Whether this status, soon after a move started a new build, is that build refusing to
     /// start: any non-zero exit that is not a terminal/job signal's (129 HUP, 130 INT, 131 QUIT,
-    /// 143 TERM), or a fault/abort signal.
+    /// 143 TERM), a fault/abort, or an untrappable SIGKILL.
     pub fn refused_start(self) -> bool {
         match self {
             Self::Code(c) => c != 0 && !matches!(c, 129 | 130 | 131 | kimi::TERM_EXIT),
             Self::Killed(s) => matches!(
                 s,
-                SIGABRT | SIGBUS | SIGFPE | SIGILL | SIGSEGV | SIGSYS | SIGTRAP
+                SIGABRT | SIGBUS | SIGFPE | SIGILL | SIGKILL | SIGSEGV | SIGSYS | SIGTRAP
             ),
         }
     }
@@ -297,17 +298,51 @@ fn reap(pid: Pid) -> Reap {
 
 /// A running vendor child.
 struct Running {
-    _child: Child,
+    _child: Option<Child>,
     pid: Pid,
     build: Build,
+    /// The launch's exact words, carried across a harness re-exec.
+    argv: Vec<OsString>,
     /// The launch's words as UTF-8, if they all are.
     words: Option<Vec<String>>,
+    /// The session most recently proven by this running child's lock.
+    session: Option<String>,
+    /// The managed account home this child runs on, if aterm selected one.
+    account: Option<aterm::Account>,
+    /// Kernel identity required before this child may cross a harness re-exec.
+    identity: Option<proc::ChildIdentity>,
+    started: Instant,
+}
+
+const CREDENTIAL_OVERRIDES: [&str; 3] = [
+    "KIMI_MODEL_NAME",
+    "KIMI_MODEL_API_KEY",
+    "KIMI_CODE_CUSTOM_HEADERS",
+];
+
+fn apply_account(env: &mut Env, account: Option<&aterm::Account>) {
+    let Some(account) = account else {
+        return;
+    };
+    for name in CREDENTIAL_OVERRIDES {
+        env.remove(name);
+    }
+    if let Some(home) = &account.home {
+        env.set(kimi::HOME_ENV, home.as_os_str());
+    } else {
+        env.remove(kimi::HOME_ENV);
+    }
 }
 
 impl Running {
     /// Start `build` with `args`, as the vendor of a harness at nesting depth `depth`. Refuses a
     /// build whose binary is this harness itself, on the first launch and on every relaunch.
-    fn start(build: Build, args: &[OsString], depth: u32) -> std::io::Result<Self> {
+    fn start(
+        build: Build,
+        args: &[OsString],
+        depth: u32,
+        account: Option<&aterm::Account>,
+    ) -> std::io::Result<Self> {
         if store::is_this_harness(&build.exe) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -322,31 +357,103 @@ impl Running {
         for (k, v) in kimi::HARNESS_ENV {
             cmd.env(k, v);
         }
+        if account.is_some() {
+            for name in CREDENTIAL_OVERRIDES {
+                cmd.env_remove(name);
+            }
+            if let Some(home) = account.and_then(|account| account.home.as_ref()) {
+                cmd.env(kimi::HOME_ENV, home);
+            } else {
+                cmd.env_remove(kimi::HOME_ENV);
+            }
+        }
         cmd.env(PID_ENV, std::process::id().to_string());
         cmd.env(DEPTH_ENV, depth.saturating_add(1).to_string());
         let child = cmd.spawn()?;
         let pid = Pid::from_child(&child);
+        let identity = proc::capture_child(child.id());
         let words = args
             .iter()
             .map(|a| a.to_str().map(str::to_owned))
             .collect::<Option<Vec<_>>>();
         Ok(Self {
-            _child: child,
+            _child: Some(child),
             pid,
             build,
+            argv: args.to_vec(),
             words,
+            session: None,
+            account: account.cloned(),
+            identity,
+            started: Instant::now(),
         })
+    }
+
+    fn adopt(state: crate::handoff::State, args: &[OsString]) -> Result<Self, String> {
+        let crate::handoff::State {
+            pid,
+            build,
+            session,
+            account,
+            started_for,
+            identity,
+            ..
+        } = state;
+        let raw_pid = u32::try_from(pid).map_err(|_| "the handoff's child pid is invalid")?;
+        let identity = match identity {
+            Some(expected) => match proc::validate_child(&expected) {
+                Ok(proc::ChildState::Live | proc::ChildState::Stopped) => expected,
+                Ok(proc::ChildState::Unreaped) => {
+                    return Err("the handoff's child has already ended".to_string());
+                }
+                Err(why) => return Err(why),
+            },
+            None => proc::capture_child(raw_pid).ok_or(
+                "the legacy handoff's child cannot be independently captured as a live child",
+            )?,
+        };
+        let pid = Pid::from_raw(pid).ok_or("the handoff's child pid is invalid")?;
+        let words = args
+            .iter()
+            .map(|a| a.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>();
+        let started = Instant::now()
+            .checked_sub(started_for)
+            .unwrap_or_else(Instant::now);
+        Ok(Self {
+            _child: None,
+            pid,
+            build,
+            argv: args.to_vec(),
+            words,
+            session,
+            account,
+            identity: Some(identity),
+            started,
+        })
+    }
+
+    /// Capture the child's current launcher/exec image immediately before a handoff, while
+    /// requiring the original kernel birth so no earlier child replacement is hidden.
+    fn handoff_identity(&self) -> Option<proc::ChildIdentity> {
+        let current = proc::capture_child(u32::try_from(self.pid.as_raw_nonzero().get()).ok()?)?;
+        self.identity
+            .as_ref()
+            .is_none_or(|original| original.birth == current.birth)
+            .then_some(current)
     }
 
     /// The environment the child runs under.
     fn env(&self, base: &Env) -> Env {
-        base.overlay(
+        let mut env = base.overlay(
             self.build
                 .shim_env
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .chain(kimi::HARNESS_ENV.iter().copied()),
-        )
+        );
+        apply_account(&mut env, self.account.as_ref());
+        env
     }
 
     /// Why this launch cannot be resumed on another build, if it cannot.
@@ -372,6 +479,7 @@ struct Moving {
     session: String,
     from: String,
     target: Build,
+    account: Option<aterm::Account>,
     sent: Instant,
 }
 
@@ -381,6 +489,7 @@ struct Moved {
     prev: Build,
     argv: Vec<String>,
     session: String,
+    account: Option<aterm::Account>,
     started: Instant,
 }
 
@@ -398,6 +507,15 @@ fn hostname() -> String {
         .nodename()
         .to_string_lossy()
         .into_owned()
+}
+
+fn own_build_id() -> Option<u64> {
+    let exe = std::env::current_exe().ok()?;
+    let build = exe.parent()?.parent()?;
+    if build.parent()?.file_name()? != NAME {
+        return None;
+    }
+    store::parse_build_id(build.file_name()?.to_str()?)
 }
 
 fn probe(pid: Pid) -> Probe {
@@ -435,12 +553,101 @@ fn session_of(env: &Env, tree: Option<&proc::Tree>, host: &str) -> Result<String
     }
 }
 
-/// Run `first` with the launch words `launch` until the session really ends.
+fn direct_session_of(env: &Env, pid: Pid, host: &str) -> Result<String, String> {
+    if !kimi::locks_enabled(env) {
+        return Err(format!("{} is off", kimi::SESSION_LOCK_ENV));
+    }
+    let home = kimi::home(env)?;
+    let pids = BTreeSet::from([pid.as_raw_nonzero().get()]);
+    let held = kimi::held_sessions(&home, &pids, host)?;
+    match held.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err("the child holds no direct session lock".to_string()),
+        many => Err(format!("the child holds {} direct sessions", many.len())),
+    }
+}
+
+fn refresh_session(cur: &mut Running, base: &Env, host: &str, journal: &mut Journal) {
+    let env = cur.env(base);
+    let next = direct_session_of(&env, cur.pid, host).or_else(|_| {
+        let tree = proc::table()
+            .ok()
+            .and_then(|table| proc::tree_of(&table, cur.pid.as_raw_nonzero().get()));
+        session_of(&env, tree.as_ref(), host)
+    });
+    let next = next.ok();
+    if next.is_some() && cur.session != next {
+        if let Some(session) = &next {
+            journal.note("SESSION", &format!("the child holds session {session}"));
+        }
+        cur.session = next;
+    }
+}
+
+fn restart_now(
+    cur: &Running,
+    claim: &mut Option<Claimed>,
+    event: &aterm::Restart,
+    journal: &mut Journal,
+) -> Option<Moving> {
+    let claimed = claim.as_mut()?;
+    if let Err(error) = claimed.relaunch_permitted() {
+        let why = match error {
+            SafePointError::Io(why) => format!("aterm's connection failed: {why}"),
+            SafePointError::Hold(why) => why,
+        };
+        journal.note("RESTART-REFUSED", &why);
+        return None;
+    }
+    let Some(session) = cur.session.clone() else {
+        journal.note(
+            "RESTART-REFUSED",
+            "no running child's session lock names the conversation",
+        );
+        return None;
+    };
+    let words = cur.words.clone().unwrap_or_default();
+    let argv = match kimi::resume_argv(&words, &session) {
+        Ok(argv) => argv,
+        Err(why) => {
+            journal.note("RESTART-REFUSED", &why.to_string());
+            return None;
+        }
+    };
+    let to = event
+        .account
+        .as_ref()
+        .map_or_else(String::new, |account| format!(" to={}", account.label));
+    journal.note(
+        "RESTART",
+        &format!("cause={}{to}: resuming session {session}", event.cause),
+    );
+    cur.signal(Signal::TERM);
+    Some(Moving {
+        argv,
+        session,
+        from: cur.build.version_label(),
+        target: cur.build.clone(),
+        account: event.account.clone().or_else(|| cur.account.clone()),
+        sent: Instant::now(),
+    })
+}
+
+/// How the supervisor obtains its vendor child.
+pub enum Start {
+    /// Spawn this build as a new child.
+    Fresh(Build),
+    /// Adopt the child preserved by the previous harness image.
+    Adopt(crate::handoff::State),
+}
+
+/// Run a fresh or adopted child with the launch words `launch` until the session really ends.
 #[allow(clippy::too_many_lines)]
 pub fn run(
     settings: &Settings,
-    first: Build,
+    start: Start,
     launch: &[OsString],
+    claim: Option<Claimed>,
     journal: &mut Journal,
 ) -> Outcome {
     let mut signals = match Signals::install() {
@@ -451,16 +658,32 @@ pub fn run(
         }
     };
     let modes = tty::Modes::save();
-    let exe = first.exe.clone();
-    let mut cur = match Running::start(first, launch, settings.depth) {
-        Ok(r) => r,
-        Err(e) => {
-            say(&format!("cannot run {}: {e}", exe.display()));
-            return Outcome::Exit(spawn_failure_code(&e));
+    let (mut cur, mut crash_relaunched, mut abandoned, event) = match start {
+        Start::Fresh(first) => {
+            let exe = first.exe.clone();
+            match Running::start(first, launch, settings.depth, None) {
+                Ok(running) => (running, false, BTreeSet::new(), "START"),
+                Err(e) => {
+                    say(&format!("cannot run {}: {e}", exe.display()));
+                    return Outcome::Exit(spawn_failure_code(&e));
+                }
+            }
+        }
+        Start::Adopt(state) => {
+            let crash_relaunched = state.crash_relaunched;
+            let abandoned = state.abandoned.clone();
+            match Running::adopt(state, launch) {
+                Ok(running) => (running, crash_relaunched, abandoned, "ADOPT"),
+                Err(why) => {
+                    journal.note("ADOPT-FAILED", &why);
+                    say(&format!("cannot adopt the running child: {why}"));
+                    return Outcome::Exit(126);
+                }
+            }
         }
     };
     journal.note(
-        "START",
+        event,
         &format!(
             "child={} {} {} ({}) interactive={}",
             cur.pid.as_raw_nonzero(),
@@ -472,15 +695,34 @@ pub fn run(
     );
     let host = hostname();
     let knobs = settings.knobs;
+    let adopted = event == "ADOPT";
+    let mut claim = claim;
+    let claim_locator = claim
+        .as_ref()
+        .map(|claimed| claimed.locator.clone())
+        .or_else(|| {
+            adopted
+                .then(|| aterm::Locator::from_env(&settings.env).ok())
+                .flatten()
+        });
+    let mut claim_tick = Instant::now()
+        .checked_sub(settings.poll)
+        .unwrap_or_else(Instant::now);
+    let mut reclaim_at = Instant::now();
+    let mut aterm_attest = false;
     let mut moving: Option<Moving> = None;
     let mut moved: Option<Moved> = None;
-    let mut abandoned = BTreeSet::new();
     let mut pending: Option<Build> = None;
+    let own_id = own_build_id().or_else(|| store::current_id(&settings.prefix, NAME));
+    let mut own_pending: Option<Build> = None;
+    let mut own_abandoned = BTreeSet::new();
+    let mut own_noted_unready: Option<u64> = None;
     let mut noted_unready: Option<u64> = None;
     let mut noted_refusal = false;
     let mut attest: Option<Attestation> = None;
     let mut window: Option<Probe> = None;
     let mut ending: Option<i32> = None;
+    let mut deferred_restart: Option<aterm::Restart> = None;
 
     loop {
         signals.wait(settings.poll);
@@ -506,10 +748,11 @@ pub fn run(
                 }
                 SIGUSR1 => {
                     attest = Some(Attestation::now());
+                    aterm_attest = false;
                     window = None;
                     journal.note(
                         "ATTEST",
-                        if pending.is_some() {
+                        if pending.is_some() || own_pending.is_some() {
                             "idle attested; an update is waiting"
                         } else {
                             "idle attested; no update is waiting"
@@ -520,7 +763,47 @@ pub fn run(
             }
         }
 
-        match reap(cur.pid) {
+        if moving.is_none() && ending.is_none() {
+            let drained = claim
+                .as_mut()
+                .and_then(|claimed| claimed.events.as_mut().map(aterm::Events::drain));
+            match drained {
+                Some(Ok(events)) => {
+                    if let Some(event) = events.restart {
+                        moving = restart_now(&cur, &mut claim, &event, journal);
+                        if moving.is_some() {
+                            deferred_restart = None;
+                            pending = None;
+                            attest = None;
+                            aterm_attest = false;
+                            window = None;
+                        } else if cur.session.is_none() {
+                            deferred_restart = Some(event);
+                        }
+                    }
+                }
+                Some(Err(why)) => {
+                    journal.note("EVENT-LOST", &why.to_string());
+                    if let Some(claimed) = claim.as_mut() {
+                        claimed.events = None;
+                        reclaim_at = Instant::now() + Duration::from_secs(5);
+                    }
+                }
+                None => {}
+            }
+            if let Some(claimed) = claim.as_mut()
+                && claimed.events.is_none()
+                && Instant::now() >= reclaim_at
+                && let Ok(sock) = claimed.locator.sock()
+            {
+                claimed.events =
+                    aterm::Events::open(&sock, &claimed.locator.sid, aterm::TIMEOUT).ok();
+            }
+        }
+
+        let reaped = reap(cur.pid);
+        let still_running = matches!(reaped, Reap::Running);
+        match reaped {
             Reap::Running => {}
             Reap::Stopped => {
                 journal.note("STOP", "the child stopped; the harness stops with it");
@@ -557,6 +840,7 @@ pub fn run(
                             session: jm.session,
                             from: cur.build.version_label(),
                             target: jm.prev,
+                            account: jm.account,
                             sent: jm.started,
                         };
                         match relaunch(settings, &cur, &back, true, &mut abandoned, journal) {
@@ -565,16 +849,84 @@ pub fn run(
                                     prev,
                                     argv: back.argv,
                                     session: back.session,
+                                    account: cur.account.clone(),
                                     started: Instant::now(),
                                 });
+                                reannounce(&mut claim, &next, journal);
                                 cur = next;
                                 pending = None;
                                 attest = None;
+                                aterm_attest = false;
                                 window = None;
                                 noted_refusal = false;
                                 continue;
                             }
                             Err(outcome) => return outcome,
+                        }
+                    }
+                    if ending.is_none()
+                        && status.refused_start()
+                        && !crash_relaunched
+                        && let Some(session) = cur.session.clone()
+                    {
+                        let permitted = claim.as_mut().map_or_else(
+                            || Err("this harness holds no aterm relaunch claim".to_string()),
+                            |claimed| {
+                                claimed.relaunch_permitted().map_err(|error| match error {
+                                    SafePointError::Io(why) => {
+                                        format!("aterm's connection failed: {why}")
+                                    }
+                                    SafePointError::Hold(why) => why,
+                                })
+                            },
+                        );
+                        match permitted {
+                            Ok(()) => {
+                                let words = cur.words.clone().unwrap_or_default();
+                                match kimi::resume_argv(&words, &session) {
+                                    Ok(argv) => {
+                                        journal.note(
+                                            "CRASH-RELAUNCH",
+                                            &format!("resuming session {session} after {status}"),
+                                        );
+                                        modes.restore();
+                                        let mv = Moving {
+                                            argv,
+                                            session,
+                                            from: cur.build.version_label(),
+                                            target: cur.build.clone(),
+                                            account: cur.account.clone(),
+                                            sent: Instant::now(),
+                                        };
+                                        match relaunch(
+                                            settings,
+                                            &cur,
+                                            &mv,
+                                            true,
+                                            &mut abandoned,
+                                            journal,
+                                        ) {
+                                            Ok(next) => {
+                                                crash_relaunched = true;
+                                                reannounce(&mut claim, &next, journal);
+                                                cur = next;
+                                                pending = None;
+                                                attest = None;
+                                                aterm_attest = false;
+                                                window = None;
+                                                noted_refusal = false;
+                                                continue;
+                                            }
+                                            Err(outcome) => return outcome,
+                                        }
+                                    }
+                                    Err(why) => journal.note(
+                                        "RELAUNCH-REFUSED",
+                                        &format!("cannot resume session {session}: {why}"),
+                                    ),
+                                }
+                            }
+                            Err(why) => journal.note("RELAUNCH-REFUSED", &why),
                         }
                     }
                     return status.outcome();
@@ -595,17 +947,42 @@ pub fn run(
                             prev: cur.build.clone(),
                             argv: mv.argv,
                             session: mv.session,
+                            account: cur.account.clone(),
                             started: Instant::now(),
                         });
+                        reannounce(&mut claim, &next, journal);
                         cur = next;
                         pending = None;
                         attest = None;
+                        aterm_attest = false;
                         window = None;
                         noted_refusal = false;
                         continue;
                     }
                     Err(outcome) => return outcome,
                 }
+            }
+        }
+
+        if still_running {
+            refresh_session(&mut cur, &settings.env, &host, journal);
+            if cur.started.elapsed() > STARTUP_GRACE {
+                crash_relaunched = false;
+            }
+        }
+
+        if still_running
+            && moving.is_none()
+            && ending.is_none()
+            && cur.session.is_some()
+            && let Some(event) = deferred_restart.take()
+        {
+            moving = restart_now(&cur, &mut claim, &event, journal);
+            if moving.is_some() {
+                pending = None;
+                attest = None;
+                aterm_attest = false;
+                window = None;
             }
         }
 
@@ -679,17 +1056,56 @@ pub fn run(
                     }
                 }
             }
-            _ => {
+            Some(_) => {
                 if pending.take().is_some() {
                     journal.note("UPDATE-WITHDRAWN", "the running build is current again");
                     window = None;
                 }
             }
+            None => {}
         }
-        let Some(target) = pending.as_ref() else {
+        match store::current_id(&settings.prefix, NAME) {
+            Some(id) if Some(id) != own_id && !own_abandoned.contains(&id) => {
+                if own_pending.as_ref().map(|b| b.id) != Some(id) {
+                    match store::current(&settings.prefix, NAME, NAME) {
+                        Ok(build) if build.id == id => {
+                            journal.note(
+                                "SELF-UPDATE",
+                                &format!(
+                                    "harness build {} is current; waiting for a safe point",
+                                    build.id
+                                ),
+                            );
+                            own_pending = Some(build);
+                            window = None;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            if own_noted_unready != Some(id) {
+                                journal.note("SELF-UPDATE-UNREADY", &error.to_string());
+                                own_noted_unready = Some(id);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                if own_pending.take().is_some() {
+                    journal.note(
+                        "SELF-UPDATE-WITHDRAWN",
+                        "the running image is current again",
+                    );
+                    window = None;
+                }
+            }
+            None => {}
+        }
+        if pending.is_none() && own_pending.is_none() && !(adopted && claim.is_none()) {
             continue;
-        };
-        if let Some(why) = cur.launch_refusal() {
+        }
+        if pending.is_some()
+            && let Some(why) = cur.launch_refusal()
+        {
             if !noted_refusal {
                 journal.note(
                     "UPDATE-WAITS",
@@ -698,6 +1114,50 @@ pub fn run(
                 noted_refusal = true;
             }
             continue;
+        }
+
+        if claim_tick.elapsed() >= settings.poll {
+            claim_tick = Instant::now();
+            match claim.as_mut().map(Claimed::safe_point) {
+                Some(Ok(_)) if attest.is_none() => {
+                    attest = Some(Attestation::now());
+                    aterm_attest = true;
+                    window = None;
+                    journal.note("ATTEST", "aterm attested an idle, empty, unheld session");
+                }
+                Some(Err(SafePointError::Io(why))) => {
+                    journal.note("UNCLAIMED", &format!("aterm's connection failed: {why}"));
+                    claim = None;
+                    reclaim_at = Instant::now() + Duration::from_secs(5);
+                    if aterm_attest {
+                        attest = None;
+                        aterm_attest = false;
+                        window = None;
+                    }
+                }
+                None if Instant::now() >= reclaim_at => {
+                    if let Some(locator) = &claim_locator {
+                        match aterm::claim(
+                            locator,
+                            std::process::id(),
+                            crate::cli::VERSION,
+                            cur.build.version.as_deref(),
+                            cur.account.as_ref().map(|account| account.label.as_str()),
+                            aterm::TIMEOUT,
+                        ) {
+                            Ok(claimed) => {
+                                journal.note("CLAIMED", "aterm's upgrade claim was re-proven");
+                                claim = Some(claimed);
+                            }
+                            Err(why) => {
+                                reclaim_at = Instant::now() + Duration::from_secs(5);
+                                journal.note("UNCLAIMED", &why);
+                            }
+                        }
+                    }
+                }
+                Some(Ok(_) | Err(SafePointError::Hold(_))) | None => {}
+            }
         }
 
         // The safe point.
@@ -711,6 +1171,7 @@ pub fn run(
                 "no safe point within the attestation's life",
             );
             attest = None;
+            aterm_attest = false;
             window = None;
             continue;
         }
@@ -724,48 +1185,134 @@ pub fn run(
                     &format!("busy: {why}; the update waits for a new attestation"),
                 );
                 attest = None;
+                aterm_attest = false;
                 window = None;
             }
             Verdict::Safe => {
-                let child_env = cur.env(&settings.env);
-                let words = cur.words.clone().unwrap_or_default();
-                let plan =
-                    session_of(&child_env, reading.tree.as_ref(), &host).and_then(|session| {
-                        kimi::resume_argv(&words, &session)
-                            .map(|argv| (session, argv))
-                            .map_err(|e| e.to_string())
-                    });
-                match plan {
-                    Ok((session, argv)) => {
-                        journal.note(
-                            "MOVE",
-                            &format!(
-                                "safe point: SIGTERM to {} pid {}; then {} {} on {}",
-                                kimi::COMMAND,
-                                cur.pid.as_raw_nonzero(),
-                                kimi::COMMAND,
-                                argv.join(" "),
-                                target.version_label()
-                            ),
-                        );
-                        moving = Some(Moving {
-                            argv,
-                            session,
-                            from: cur.build.version_label(),
-                            target: target.clone(),
-                            sent: Instant::now(),
-                        });
-                        cur.signal(Signal::TERM);
+                let host_check = if aterm_attest {
+                    claim.as_mut().map_or_else(
+                        || Err("aterm's claim was lost".to_string()),
+                        |claimed| {
+                            claimed
+                                .safe_point()
+                                .map(|_| ())
+                                .map_err(|error| match error {
+                                    SafePointError::Io(why) => {
+                                        format!("aterm's connection failed: {why}")
+                                    }
+                                    SafePointError::Hold(why) => why,
+                                })
+                        },
+                    )
+                } else {
+                    Ok(())
+                };
+                if let Some(target) = own_pending.clone().filter(|_| moved.is_none()) {
+                    match host_check {
+                        Ok(()) => {
+                            let state = crate::handoff::State {
+                                pid: cur.pid.as_raw_nonzero().get(),
+                                build: cur.build.clone(),
+                                session: cur.session.clone(),
+                                account: cur.account.clone(),
+                                started_for: cur.started.elapsed(),
+                                crash_relaunched,
+                                abandoned: abandoned.clone(),
+                                identity: cur.handoff_identity(),
+                            };
+                            journal.note(
+                                "REEXEC",
+                                &format!(
+                                    "safe point: replacing the harness image with {}; child {} runs on",
+                                    target.exe.display(),
+                                    cur.pid.as_raw_nonzero()
+                                ),
+                            );
+                            let error = crate::handoff::exec(&target.exe, &cur.argv, &state);
+                            journal.note(
+                                "REEXEC-FAILED",
+                                &format!("{error}; the old harness and child still run"),
+                            );
+                            own_abandoned.insert(target.id);
+                            own_pending = None;
+                        }
+                        Err(why) => journal.note(
+                            "REFUSED",
+                            &format!("{why}; the harness update waits for a new attestation"),
+                        ),
                     }
-                    Err(why) => journal.note(
-                        "REFUSED",
-                        &format!("{why}; the update waits for a new attestation"),
-                    ),
+                } else if let Some(target) = pending.as_ref() {
+                    let child_env = cur.env(&settings.env);
+                    let words = cur.words.clone().unwrap_or_default();
+                    let plan = host_check.and_then(|()| {
+                        session_of(&child_env, reading.tree.as_ref(), &host)
+                            .or_else(|_| {
+                                cur.session.clone().ok_or_else(|| {
+                                    "no current or most recently proven session lock names the conversation"
+                                        .to_string()
+                                })
+                            })
+                            .and_then(|session| {
+                                kimi::resume_argv(&words, &session)
+                                    .map(|argv| (session, argv))
+                                    .map_err(|e| e.to_string())
+                            })
+                    });
+                    match plan {
+                        Ok((session, argv)) => {
+                            journal.note(
+                                "MOVE",
+                                &format!(
+                                    "safe point: SIGTERM to {} pid {}; then {} {} on {}",
+                                    kimi::COMMAND,
+                                    cur.pid.as_raw_nonzero(),
+                                    kimi::COMMAND,
+                                    argv.join(" "),
+                                    target.version_label()
+                                ),
+                            );
+                            moving = Some(Moving {
+                                argv,
+                                session,
+                                from: cur.build.version_label(),
+                                target: target.clone(),
+                                account: cur.account.clone(),
+                                sent: Instant::now(),
+                            });
+                            cur.signal(Signal::TERM);
+                        }
+                        Err(why) => journal.note(
+                            "REFUSED",
+                            &format!("{why}; the update waits for a new attestation"),
+                        ),
+                    }
                 }
                 attest = None;
+                aterm_attest = false;
                 window = None;
             }
         }
+    }
+}
+
+fn reannounce(claim: &mut Option<Claimed>, running: &Running, journal: &mut Journal) {
+    let Some(claimed) = claim.as_mut() else {
+        return;
+    };
+    if let Err(why) = claimed.reclaim(
+        std::process::id(),
+        crate::cli::VERSION,
+        running.build.version.as_deref(),
+        running
+            .account
+            .as_ref()
+            .map(|account| account.label.as_str()),
+    ) {
+        journal.note(
+            "UNCLAIMED",
+            &format!("the new vendor version could not be announced: {why}"),
+        );
+        *claim = None;
     }
 }
 
@@ -832,7 +1379,7 @@ fn relaunch(
             mv.from,
             mv.session
         ));
-        match Running::start(build, &args, settings.depth) {
+        match Running::start(build, &args, settings.depth, mv.account.as_ref()) {
             Ok(next) => {
                 journal.note(
                     "RELAUNCHED",
@@ -897,7 +1444,7 @@ mod tests {
         assert!(Status::Killed(SIGTERM).after_our_term());
         assert!(!Status::Code(0).after_our_term());
         assert!(!Status::Code(129).after_our_term());
-        assert!(!Status::Killed(SIGKILL_FOR_TEST).after_our_term());
+        assert!(!Status::Killed(SIGKILL).after_our_term());
     }
 
     #[test]
@@ -907,6 +1454,7 @@ mod tests {
         assert!(Status::Code(127).refused_start());
         assert!(Status::Killed(SIGABRT).refused_start());
         assert!(Status::Killed(SIGSEGV).refused_start());
+        assert!(Status::Killed(SIGKILL).refused_start());
         assert!(!Status::Code(0).refused_start());
         assert!(!Status::Code(129).refused_start());
         assert!(!Status::Code(130).refused_start());
@@ -914,10 +1462,7 @@ mod tests {
         assert!(!Status::Code(143).refused_start());
         assert!(!Status::Killed(SIGTERM).refused_start());
         assert!(!Status::Killed(SIGHUP).refused_start());
-        assert!(!Status::Killed(SIGKILL_FOR_TEST).refused_start());
     }
-
-    const SIGKILL_FOR_TEST: i32 = 9;
 
     #[test]
     fn knobs_read_from_the_env_and_clamp() {

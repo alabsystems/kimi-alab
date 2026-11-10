@@ -802,6 +802,7 @@ mod tests {
 
     #[test]
     fn sidecars_are_read_from_one_handle_and_refuse_symlinks_and_fifos() {
+        let _process = crate::proc::PROCESS_TEST_LOCK.lock().unwrap();
         let s = Scratch::new("sidecar");
         let file = s.0.join("1.ready");
         std::fs::write(&file, "ok\n").unwrap();

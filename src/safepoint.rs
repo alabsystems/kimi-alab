@@ -5,18 +5,18 @@
 //!
 //! The ruling is "turn ended, composer empty, no person typing", and fail closed: never stop a
 //! busy child. The harness inherits the terminal and does not proxy it, so it cannot read the
-//! screen; aterm's own Kimi reader does not yet call any phase authoritative either ("a busy
-//! turn is unmeasured", aterm `crates/aterm-phase/src/kimi.rs:11`). So in 0.1 the decision has
-//! two halves, and BOTH must hold:
+//! screen itself. The decision has two halves, and BOTH must hold:
 //!
-//! 1. **An idle attestation** — `SIGUSR1` to the harness — from something that can see the
-//!    screen (a person today; aterm under contract 3, the next milestone) saying the turn has
-//!    ended, the composer is empty and no background task runs. It is good for
+//! 1. **An idle attestation** — under a proven aterm contract-3 upgrade claim, one fresh
+//!    policy/status pair saying the turn is idle, the composer empty or placeholder, nobody typing
+//!    or holding the session, and upgrades enabled. Elsewhere `SIGUSR1` vouches for those facts.
+//!    Aterm's evidence is refreshed again at the actual stop point. An attestation is good for
 //!    [`Knobs::attest_valid`].
 //! 2. **The harness's own backstops**, over a quiet window of [`Knobs::quiet`] measured from the
 //!    attestation: no keystroke was read and nothing was drawn since the attestation (the tty's
-//!    own times, [`crate::tty`]), the child's process tree did not change, and the tree used no
-//!    more than [`Knobs::cpu_budget`] of CPU.
+//!    own times, [`crate::tty`]), the child's process tree did not change, no descendant shell
+//!    or background keepalive runs (apart from the vendor's direct `caffeinate`), and the tree
+//!    used no more than [`Knobs::cpu_budget`] of CPU.
 //!
 //! Any reading that cannot be taken counts as busy. A busy verdict ends that attestation; the
 //! harness then waits for a new one and never retries on its own.
@@ -103,6 +103,8 @@ pub enum Busy {
     Unreadable,
     /// A process joined or left the child's tree during the window.
     TreeChanged,
+    /// A shell or keepalive process is still running beneath the child.
+    Background(String),
     /// The tree used this much CPU during the window, over the budget.
     Working(Duration),
 }
@@ -117,6 +119,7 @@ impl std::fmt::Display for Busy {
             Self::Drawing => write!(f, "the screen was drawn after the attestation"),
             Self::Unreadable => write!(f, "the child's process tree could not be read"),
             Self::TreeChanged => write!(f, "a process joined or left the child's tree"),
+            Self::Background(work) => write!(f, "background work runs under the child: {work}"),
             Self::Working(cpu) => write!(f, "the child's tree used {} ms of CPU", cpu.as_millis()),
         }
     }
@@ -157,6 +160,15 @@ pub fn judge(att: &Attestation, start: &Probe, now: &Probe, knobs: &Knobs) -> Ve
     if first.pids != last.pids {
         return Verdict::Busy(Busy::TreeChanged);
     }
+    if !last.background.is_empty() {
+        return Verdict::Busy(Busy::Background(
+            last.background
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","),
+        ));
+    }
     let used = last.cpu.saturating_sub(first.cpu);
     if used > knobs.cpu_budget {
         return Verdict::Busy(Busy::Working(used));
@@ -192,6 +204,7 @@ mod tests {
         Tree {
             pids: pids.iter().copied().collect::<BTreeSet<_>>(),
             cpu: Duration::from_millis(cpu_ms),
+            background: BTreeSet::new(),
         }
     }
 
@@ -369,6 +382,23 @@ mod tests {
                 &knobs()
             ),
             Verdict::Busy(Busy::Working(Duration::from_millis(300)))
+        );
+    }
+
+    #[test]
+    fn stable_idle_background_work_is_still_busy() {
+        let c = Case::new();
+        let start = c.probe(0, -30, -30, Some(tree(&[10, 11], 1000)));
+        let mut running = tree(&[10, 11], 1000);
+        running.background.insert("sh".to_string());
+        assert_eq!(
+            judge(
+                &c.att,
+                &start,
+                &c.probe(10, -30, -30, Some(running)),
+                &knobs()
+            ),
+            Verdict::Busy(Busy::Background("sh".to_string()))
         );
     }
 

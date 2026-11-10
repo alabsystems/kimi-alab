@@ -46,6 +46,7 @@ rec="$FAKE_REC"
 ev="$rec/$label.events"
 { printf '%s' "$label"; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$rec/argv"
 echo "auto_update=${KIMI_CODE_NO_AUTO_UPDATE-unset} shim=${FAKE_SHIM-unset}" > "$rec/$label.env"
+printf 'home=%s model=%s key=%s headers=%s\n' "${KIMI_CODE_HOME-default}" "${KIMI_MODEL_NAME+set}" "${KIMI_MODEL_API_KEY+set}" "${KIMI_CODE_CUSTOM_HEADERS+set}" >> "$rec/$label.account"
 ulimit -c 0
 case "${FAKE_MODE:-session}" in
 exit) exit "${FAKE_EXIT:-0}" ;;
@@ -53,8 +54,9 @@ selfkill) kill -"${FAKE_SIG:-SEGV}" $$; exit 99 ;;
 stop) echo "$$" > "$rec/$label.pid"; kill -STOP $$; echo continued >> "$ev"; exit "${FAKE_EXIT:-5}" ;;
 esac
 spid=
+workpid=
 lock=
-quit() { if [ -n "$lock" ]; then rm -f "$lock"; fi; if [ -n "$spid" ]; then kill "$spid" 2>/dev/null; fi; echo "$1" >> "$ev"; exit "$2"; }
+quit() { if [ -n "$lock" ]; then rm -f "$lock"; fi; if [ -n "$spid" ]; then kill "$spid" 2>/dev/null; fi; if [ -n "$workpid" ]; then kill "$workpid" 2>/dev/null; fi; echo "$1" >> "$ev"; exit "$2"; }
 trap 'if [ -n "$FAKE_IGNORE_TERM" ] && [ ! -e "$rec/honor-term" ]; then echo term-ignored >> "$ev"; else quit term 143; fi' TERM
 trap 'quit hup 129' HUP
 trap 'echo int >> "$ev"' INT
@@ -67,6 +69,19 @@ fi
 if [ -n "$FAKE_READ" ]; then exec 3<&0; cat <&3 > /dev/null & fi
 sleep 3600 & spid=$!
 echo "$$" > "$rec/$label.pid.tmp"; mv "$rec/$label.pid.tmp" "$rec/$label.pid"
+if [ -e "$rec/background-work" ]; then
+  sh -c 'while [ ! -e "$1" ]; do sleep 1; done' sh "$rec/stop-background" & workpid=$!
+fi
+if [ "${FAKE_MODE:-session}" = crash ] && [ ! -e "$rec/crashed" ]; then
+  : > "$rec/crashed"
+  if [ -e "$rec/unlock-before-crash" ]; then rm -f "$lock"; lock=; fi
+  sleep 1
+  kill -"${FAKE_SIG:-SEGV}" $$
+fi
+if [ "${FAKE_MODE:-session}" = crashloop ]; then
+  sleep 1
+  kill -"${FAKE_SIG:-SEGV}" $$
+fi
 if [ -n "$FAKE_BURN" ]; then while [ ! -e "$rec/stop-burn" ]; do :; done; fi
 if [ -n "$FAKE_DRAW" ]; then while :; do printf .; done; fi
 while :; do
@@ -88,6 +103,146 @@ struct Lab {
 struct Pty {
     writer: File,
     seen: Arc<Mutex<Vec<u8>>>,
+}
+
+struct FakeAterm {
+    runtime: PathBuf,
+    claims: Arc<Mutex<Vec<String>>>,
+    sock: PathBuf,
+    token: PathBuf,
+    restart_tx: std::sync::mpsc::Sender<String>,
+}
+
+impl FakeAterm {
+    fn restart(&self) {
+        self.restart_tx
+            .send("restart cause=asked".to_string())
+            .unwrap();
+    }
+
+    fn restart_account(&self, home: &Path) {
+        let home = home
+            .to_string_lossy()
+            .replace('%', "%25")
+            .replace('/', "%2F")
+            .replace(' ', "%20");
+        self.restart_tx
+            .send(format!("restart cause=account to=work home={home}"))
+            .unwrap();
+    }
+}
+
+impl Drop for FakeAterm {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock);
+        let _ = std::fs::remove_file(&self.token);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn fake_aterm(root: &Path, sid: &str) -> FakeAterm {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let runtime = root.join("aterm");
+    std::fs::create_dir_all(runtime.join("graph")).unwrap();
+    let sock = std::env::temp_dir().join(format!(
+        "ka-{}-{}.sock",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let token = sock.with_file_name(format!(
+        "{}.token",
+        sock.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&token, "test-token\n").unwrap();
+    std::fs::write(
+        runtime.join("graph").join(sid),
+        format!("sock {}\n", sock.display()),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(&sock).unwrap();
+    let claims = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&claims);
+    let sid = sid.to_string();
+    let (restart_tx, restart_rx) = std::sync::mpsc::channel();
+    let restart_rx = std::sync::Arc::new(Mutex::new(Some(restart_rx)));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                break;
+            };
+            let recorded = Arc::clone(&recorded);
+            let sid = sid.clone();
+            let restart_rx = Arc::clone(&restart_rx);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream;
+                let mut supervisor = String::from("kimi-alab@0");
+                let mut lines = String::new();
+                loop {
+                    lines.clear();
+                    let Ok(read) = reader.read_line(&mut lines) else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    let line = lines.trim_end();
+                    if line.starts_with("AUTH ") {
+                        assert_eq!(line, "AUTH test-token");
+                        continue;
+                    }
+                    if line == format!("subscribe @{sid} events") {
+                        if writeln!(writer, "OK subscribe 1\nsub @{sid} events").is_err() {
+                            break;
+                        }
+                        if let Some(rx) = restart_rx.lock().unwrap().take() {
+                            let Ok(event) = rx.recv() else {
+                                break;
+                            };
+                            if writeln!(writer, "EVENT {sid} {event}").is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let reply = if line == "version" {
+                        "OK fake-aterm".to_string()
+                    } else if line == format!("@{sid} harness policy") {
+                        "OK gen=1 effective=on why=enabled contract=2,3 relaunch=true upgrade=true upgrade_ask=false human_grace_s=0".to_string()
+                    } else if let Some(claim) =
+                        line.strip_prefix(&format!("@{sid} meta set supervisor "))
+                    {
+                        supervisor = claim
+                            .split(" contract=3 ")
+                            .next()
+                            .unwrap_or("kimi-alab@0")
+                            .to_string();
+                        recorded.lock().unwrap().push(claim.to_string());
+                        assert!(claim.contains(" scope=relaunch,upgrade "), "{claim}");
+                        "OK".to_string()
+                    } else if line == format!("@{sid} status") {
+                        format!(
+                            "OK schema=1 supervisor={supervisor} supervisor_proven=1 agent=idle composer=empty human_ms=- hand=- hold=0 input=clear need=-"
+                        )
+                    } else {
+                        "ERR unexpected verb".to_string()
+                    };
+                    if writeln!(writer, "{reply}").is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    FakeAterm {
+        runtime,
+        claims,
+        sock,
+        token,
+        restart_tx,
+    }
 }
 
 impl Lab {
@@ -146,6 +301,27 @@ impl Lab {
     fn lay_harness(&self, id: u64, version: &str) {
         let exe = self.lay_dir(id, version).join("bin/kimi");
         std::fs::hard_link(HARNESS, &exe).unwrap();
+    }
+
+    fn lay_own_image(&self, id: u64) -> PathBuf {
+        let dir = self.prefix().join("store/kimi-alab").join(id.to_string());
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let exe = dir.join("bin/kimi-alab");
+        std::fs::copy(HARNESS, &exe).unwrap();
+        std::fs::write(
+            dir.with_file_name(format!("{id}.ready")),
+            "ok\ncontents=bin:kimi-alab\n",
+        )
+        .unwrap();
+        exe
+    }
+
+    fn make_own_current(&self, id: u64) {
+        let pdir = self.prefix().join("store/kimi-alab");
+        let tmp = pdir.join(".current.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        symlink(pdir.join(id.to_string()), &tmp).unwrap();
+        std::fs::rename(&tmp, pdir.join("current")).unwrap();
     }
 
     /// Lay build `id`'s directory and sidecars; the caller writes `bin/kimi`.
@@ -574,11 +750,12 @@ fn a_child_that_stops_stops_the_harness_and_continue_resumes_both() {
 }
 
 #[test]
-fn moves_onto_a_new_build_with_the_resume_argv_at_a_safe_point() {
+fn moves_onto_a_new_build_after_the_session_lock_disappears() {
     let mut lab = Lab::new("move");
     let mut child = lab.running_a_on_pty(&["--yolo", "--skills-dir", "/sk", "-m", "k2"], &[]);
     let harness = Pid::from_child(&child);
     lab.install_b();
+    std::fs::remove_file(lab.root.join("kimi-home/locks/sessions/sess-1.lock")).unwrap();
     signal(&child, Signal::USR1);
     assert!(
         wait_for(Duration::from_secs(10), || lab.pid_of("B").is_some()),
@@ -620,6 +797,372 @@ fn moves_onto_a_new_build_with_the_resume_argv_at_a_safe_point() {
         wait_exit(&mut child, Duration::from_secs(10)).code(),
         Some(143)
     );
+}
+
+#[test]
+fn aterm_attests_and_reclaims_an_automatic_move() {
+    let mut lab = Lab::new("aterm-move");
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let runtime = &aterm.runtime;
+    let claims = &aterm.claims;
+    assert!(runtime.join("graph/s-beef").is_file());
+    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+        ],
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || claims.lock().unwrap().len()
+            == 1),
+        "aterm never proved the initial claim; journal:\n{}",
+        lab.journal()
+    );
+    lab.install_b();
+    assert!(
+        wait_for(Duration::from_secs(10), || lab.pid_of("B").is_some()),
+        "aterm's attestation never moved B; journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(
+        lab.argv(),
+        "A [--skills-dir] [/sk]\nB [--skills-dir] [/sk] [--session] [sess-1]\n"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || claims.lock().unwrap().len() == 2),
+        "the new vendor was not announced: {:?}",
+        claims.lock().unwrap()
+    );
+    let claims = claims.lock().unwrap();
+    assert!(
+        claims[0].contains(format!("version={} vendor=2.3.1", kimi_alab::cli::VERSION).as_str()),
+        "{claims:?}"
+    );
+    assert!(
+        claims[1].contains(format!("version={} vendor=2.3.2", kimi_alab::cli::VERSION).as_str()),
+        "{claims:?}"
+    );
+    drop(claims);
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn aterm_relaunches_a_crashed_child_on_the_same_session() {
+    let mut lab = Lab::new("cr");
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let runtime = &aterm.runtime;
+    let claims = &aterm.claims;
+    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+            ("FAKE_MODE", "crash"),
+            ("FAKE_SIG", "KILL"),
+        ],
+    );
+    let first = lab.pid_of("A").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the crash was not relaunched; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        lab.argv(),
+        "A [--skills-dir] [/sk]\nA [--skills-dir] [/sk] [--session] [sess-1]\n"
+    );
+    assert!(lab.journal().contains("CRASH-RELAUNCH"));
+    assert_eq!(claims.lock().unwrap().len(), 2);
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn aterm_relaunches_after_the_session_lock_disappears_before_a_crash() {
+    let mut lab = Lab::new("cr-unlock");
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let runtime = &aterm.runtime;
+    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+            ("FAKE_MODE", "crash"),
+            ("FAKE_SIG", "KILL"),
+        ],
+    );
+    let first = lab.pid_of("A").unwrap();
+    std::fs::write(lab.rec().join("unlock-before-crash"), "").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the crash was not relaunched after the lock disappeared; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
+    assert!(lab.journal().contains("CRASH-RELAUNCH"));
+    assert_eq!(aterm.claims.lock().unwrap().len(), 2);
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn aterm_restart_event_restarts_the_same_session() {
+    let mut lab = Lab::new("rs");
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let runtime = &aterm.runtime;
+    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+        ],
+    );
+    let first = lab.pid_of("A").unwrap();
+    aterm.restart();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the restart event did not restart A; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        lab.argv(),
+        "A [--skills-dir] [/sk]\nA [--skills-dir] [/sk] [--session] [sess-1]\n"
+    );
+    assert!(lab.journal().contains("RESTART cause=asked"));
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn aterm_account_event_moves_home_and_drops_credential_overrides() {
+    let mut lab = Lab::new("account");
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let runtime = &aterm.runtime;
+    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+            ("KIMI_MODEL_NAME", "other-account"),
+            ("KIMI_MODEL_API_KEY", "test-only-key"),
+            ("KIMI_CODE_CUSTOM_HEADERS", "Authorization: test-only"),
+        ],
+    );
+    let first = lab.pid_of("A").unwrap();
+    let target = lab.root.join("account home");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(lab.root.join("kimi-home/sessions")).unwrap();
+    symlink(lab.root.join("kimi-home/locks"), target.join("locks")).unwrap();
+    symlink(lab.root.join("kimi-home/sessions"), target.join("sessions")).unwrap();
+    aterm.restart_account(&target);
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the account event did not restart A; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        lab.argv(),
+        "A [--skills-dir] [/sk]\nA [--skills-dir] [/sk] [--session] [sess-1]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lab.rec().join("A.account")).unwrap(),
+        format!(
+            "home={} model=set key=set headers=set\nhome={} model= key= headers=\n",
+            lab.root.join("kimi-home").display(),
+            target.display()
+        )
+    );
+    assert!(
+        lab.journal()
+            .contains("RESTART cause=account to=work: resuming session sess-1")
+    );
+    assert!(
+        aterm
+            .claims
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|claim| claim.ends_with("login=work"))
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn harness_reexec_keeps_the_child_pid_and_managed_account() {
+    let mut lab = Lab::new("self-exec");
+    lab.lay_own_image(1);
+    lab.make_own_current(1);
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let xdg = aterm
+        .runtime
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+        ],
+    );
+    let first = lab.pid_of("A").unwrap();
+    let target = lab.root.join("account home");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(lab.root.join("kimi-home/sessions")).unwrap();
+    symlink(lab.root.join("kimi-home/locks"), target.join("locks")).unwrap();
+    symlink(lab.root.join("kimi-home/sessions"), target.join("sessions")).unwrap();
+    aterm.restart_account(&target);
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+                && aterm.claims.lock().unwrap().len() == 2
+        }),
+        "the account move did not finish; journal:\n{}",
+        lab.journal()
+    );
+    let preserved = lab.pid_of("A").unwrap();
+
+    lab.lay_own_image(2);
+    lab.make_own_current(2);
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.journal().contains(" ADOPT ") && aterm.claims.lock().unwrap().len() == 3
+        }),
+        "the new harness image did not adopt the child; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(lab.pid_of("A"), Some(preserved), "the child was replaced");
+    assert_eq!(
+        lab.argv(),
+        "A [--skills-dir] [/sk]\nA [--skills-dir] [/sk] [--session] [sess-1]\n",
+        "re-exec started no vendor process"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lab.rec().join("A.account")).unwrap(),
+        format!(
+            "home={} model= key= headers=\nhome={} model= key= headers=\n",
+            lab.root.join("kimi-home").display(),
+            target.display()
+        )
+    );
+    assert!(
+        aterm
+            .claims
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|claim| claim.ends_with("login=work"))
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn a_failed_harness_reexec_leaves_the_old_supervisor_and_child_alive() {
+    let mut lab = Lab::new("self-exec-fails");
+    lab.lay_own_image(1);
+    lab.make_own_current(1);
+    let mut child = lab.running_a_on_pty(&[], &[]);
+    let vendor = lab.pid_of("A").unwrap();
+    let replacement = lab.lay_own_image(2);
+    lab.make_own_current(2);
+    assert!(
+        wait_for(Duration::from_secs(10), || lab
+            .journal()
+            .contains("SELF-UPDATE ")),
+        "the harness did not see its update; journal:\n{}",
+        lab.journal()
+    );
+    std::fs::remove_file(replacement).unwrap();
+    signal(&child, Signal::USR1);
+    assert!(
+        wait_for(Duration::from_secs(10), || lab
+            .journal()
+            .contains("REEXEC-FAILED")),
+        "the failed exec was not journaled; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(lab.pid_of("A"), Some(vendor));
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
+fn a_second_crash_inside_startup_grace_does_not_loop() {
+    let mut lab = Lab::new("cl");
+    let aterm = fake_aterm(&lab.root, "s-beef");
+    let runtime = &aterm.runtime;
+    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &[
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-beef"),
+            ("XDG_RUNTIME_DIR", &xdg),
+            ("FAKE_MODE", "crashloop"),
+        ],
+    );
+    let first = lab.pid_of("A").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the first crash was not relaunched; journal:\n{}",
+        lab.journal()
+    );
+    let status = wait_exit(&mut child, Duration::from_secs(10));
+    assert_eq!(status.signal(), Some(11), "status: {status:?}");
+    assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
 }
 
 #[test]
@@ -719,11 +1262,30 @@ fn never_moves_while_the_child_works() {
 }
 
 #[test]
+fn never_moves_while_background_work_runs() {
+    let mut lab = Lab::new("background-work");
+    std::fs::write(lab.rec().join("background-work"), "").unwrap();
+    let mut child = lab.running_a_on_pty(&[], &[]);
+    lab.install_b();
+    assert_refused(&lab, &child, "background work runs under the child: sh");
+    std::fs::write(lab.rec().join("stop-background"), "").unwrap();
+    signal(&child, Signal::TERM);
+    assert_eq!(
+        wait_exit(&mut child, Duration::from_secs(10)).code(),
+        Some(143)
+    );
+}
+
+#[test]
 fn never_moves_a_child_that_holds_no_session() {
     let mut lab = Lab::new("no-session");
     let mut child = lab.running_a_on_pty(&[], &[("FAKE_SESSION", "none")]);
     lab.install_b();
-    assert_refused(&lab, &child, "holds no session lock");
+    assert_refused(
+        &lab,
+        &child,
+        "no current or most recently proven session lock",
+    );
     signal(&child, Signal::TERM);
     assert_eq!(
         wait_exit(&mut child, Duration::from_secs(10)).code(),

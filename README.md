@@ -6,8 +6,9 @@ The ALab harness for Moonshot AI's **Kimi Code** CLI (`kimi`).
 on your terminal. It passes every argument through, follows the child's signals and stops, and
 exits with the child's own status. When atpkg installs a newer `kimi` while a session is
 running, the harness waits for a safe point and resumes **the same session** on the new build,
-and the harness process never exits while it does so. It never ships, forks or patches vendor
-bytes, and its version is independent of the vendor's.
+and the harness process never exits while it does so. A new harness build likewise crosses a safe
+point by `exec`, keeping the harness pid and leaving the vendor child running. It never ships,
+forks or patches vendor bytes, and its version is independent of the vendor's.
 
 Inside aterm, atpkg's managed `kimi` twin automatically starts an installed, live `kimi-alab`
 as `kimi-alab run -- …`. `--no-harness`, `--no-alab-harness` or `ATERM_NO_HARNESS=1` keeps the
@@ -112,15 +113,28 @@ different complete build, the update **waits** for a safe point. When the safe p
    `kimi-alab: Kimi Code 2.3.1 -> 2.3.2: resuming session <id> on it`. If no build will start,
    it exits and prints `kimi -r <id>` so you can resume the session by hand.
 
+The harness also watches `store/kimi-alab/current`. At the same kind of safe point it `exec`s the
+new harness image in the same pid **without stopping or replacing the vendor child**. The child
+pid, vendor build, session, selected account, crash-loop state and kernel identity cross on an
+inherited, unlinked regular file; the current launch words cross in argv. Before the handoff the
+harness captures the child's current executable and original kernel birth; the new image refuses
+adoption unless parentage, birth, process group, session, live state and executable still match.
+A legacy handoff without identity is admitted only by independently capturing its direct live
+child. The old claim connection closes on `exec`, and the new image claims the same aterm session
+again. If the replacement cannot be executed, `REEXEC-FAILED` is journaled and the old harness
+and child keep running.
+
 **The safe point needs both halves:**
 
-* **An idle attestation**: `kill -USR1 <kimi-alab pid>` from something that can see the
-  screen. It says the turn has ended, the composer is empty and no background task is running.
-  Today that is a person. Under aterm's contract 3 (the next milestone) it will be aterm's
-  Kimi screen reader. An attestation is good for 120 s.
+* **An idle attestation**: under a proven aterm contract-3 `upgrade` claim, a fresh policy and
+  status read says `agent=idle`, `composer=empty` or `placeholder`, upgrades are enabled without
+  asking, and nobody is typing or holding the session. aterm's evidence is checked again at the
+  actual stop point. Outside aterm (or as an explicit override), `kill -USR1 <kimi-alab pid>`
+  vouches for the same facts. An attestation is good for 120 s.
 * **The harness's own backstops**, over 10 s after the attestation: no keystroke was read and
   nothing was drawn on the terminal since the attestation (the tty's own access and modify
-  times), no process started or ended under `kimi`, and the `kimi` tree used under 2% CPU.
+  times), no process started or ended under `kimi`, no descendant shell or background keepalive
+  runs (the vendor's direct `caffeinate` excepted), and the `kimi` tree used under 2% CPU.
 
 If any reading fails or shows activity, the child counts as busy. That attestation ends, and the
 harness waits for a new one; it never retries on its own. A busy `kimi` is never stopped. The
@@ -138,15 +152,45 @@ it. It rotates at 4 MiB.
 Tuning (and testing) knobs: `KIMI_ALAB_POLL_MS` (20–5000, default 250), `KIMI_ALAB_QUIET_MS`
 (at least 200, default 10000), `KIMI_ALAB_ATTEST_MS` (default 120000).
 
-### aterm supervision: not claimed
+### aterm supervision: proven relaunch and upgrade claims
 
-The harness does **not** claim supervision of an aterm session. aterm recognizes `kimi-alab` as
-Kimi for screen reading, but does not advertise contract 3 to it (Kimi is `supervisable() ==
-false` there). `src/aterm.rs` is the marked, inert module boundary for the next milestone: the
-claim (`kimi-alab@<pid> contract=3 scope=relaunch,upgrade version=<version> [vendor=<vendor
-version>]`, grok-alab's grammar, `vendor=` only when the record names one; proven by leading the
-terminal's foreground group), the `if-supervisor=` input fence, and aterm raising the idle
-attestation from its screen reader. `kimi-alab --alab-which` says so on its last line.
+Inside aterm, the harness reads `@self harness policy` over the session's authenticated control
+socket and, when the host serves contract 3 with supervision effective, claims
+`kimi-alab@<pid> contract=3 scope=relaunch,upgrade version=<version> [vendor=<vendor version>]`
+before it spawns Kimi. It keeps that connection open, requires `status` to confirm
+`supervisor_proven=1`, reconnects if the connection is lost, and re-announces the vendor after
+every move.
+
+A noninteractive launch, `--alab-no-update`, `ATERM_NO_HARNESS=1`, a missing/older control socket,
+a refused or unproven claim, or a policy with supervision off makes the harness **exec the vendor
+in its place** instead. Kimi then runs under its own name with no second supervisor. aterm's
+built-in Kimi policy retains turn-end, approvals, questions and walls. `kimi-alab --alab-which`
+names the scopes it will claim.
+
+While Kimi runs, the harness follows the session id in its lock. After an abnormal exit or fault,
+a fresh proven claim and `[harness] relaunch = true` let it resume that session with the carried
+flags and `--session <id>`, on the same build when it remains usable. A second crash within the
+15-second startup grace ends with the child's status instead of looping. Clean exits, intentional
+`HUP`/`TERM` endings, and crashes without a proven session id or relaunch claim keep their original
+status.
+
+aterm's explicit, stall and memory-pressure restart acts publish `restart cause=<why>` on the
+session's event stream for a proven relaunch claimant instead of signalling its process group. The
+harness subscribes on a second authenticated connection, rechecks its claim and relaunch policy,
+and resumes the locked session on the same build with the carried flags and `--session <id>`. It
+sends Kimi one graceful `SIGTERM`; if that move cannot be proven or the child's exit is not the
+expected one, the harness reports the refusal or child's status rather than killing the group or
+restarting unconditionally. A lost event connection is reopened with the current control socket.
+
+aterm's account pool can also publish `restart cause=account[-ahead] to=<label> home=<pct>`.
+The harness applies the selected `KIMI_CODE_HOME`, removes `KIMI_MODEL_NAME`,
+`KIMI_MODEL_API_KEY` and `KIMI_CODE_CUSTOM_HEADERS`, and resumes the same session on that
+login. Pool overlay homes share sessions, locks and folder trust with the default home, so no
+conversation data is copied and a credential renewal can resume in place. The selected account
+stays on later crash and upgrade relaunches. Each successful child start re-announces
+`login=<label>` in the scoped claim, which is how aterm distinguishes an applied account move
+from an event merely queued. A lost-login renewal uses the same handoff; no Claude-style `/login`
+dialog is driven.
 
 ## Build and test
 
@@ -197,8 +241,9 @@ Read, not guessed:
 * aterm `crates/atpkg/src/vendor_direct/table.rs:659-735` (the `kimi` row), `store.rs`
   (`current`, `.ready`), `shim_env.rs`: the store layout and admission rules ported in
   `src/store.rs`.
-* aterm `crates/aterm-phase/src/kimi.rs:11`: "A busy turn is unmeasured, so no phase is
-  authoritative". That is why the safe point needs an attestation in this release.
+* aterm `crates/aterm-phase/src/kimi.rs`: the measured spinner/idle grammar and composer reader.
+  aterm publishes those as `agent=` and `composer=`; the harness still applies its own terminal,
+  process-tree and CPU backstops before stopping a child.
 * Kimi Code 2.3.1 (MoonshotAI/kimi-code, tag `@moonshot-ai/kimi-code@2.3.1`, MIT):
   `apps/kimi-code/src/cli/commands.ts` (flags, subcommands), `src/tui/kimi-tui.ts`
   (1050-1053 and 2916-2930: resume flags override persisted state; 1170-1201: `SIGTERM`
@@ -228,11 +273,11 @@ Choices made without the owner, each fail-closed and reversible:
    followed like an upgrade. The harness runs what atpkg has made current; it never compares
    versions itself.
 5. **The safe point is attested, not inferred.** The harness inherits the terminal and cannot
-   read the screen, and aterm's own Kimi reader calls no phase authoritative. So a move needs an
-   idle attestation (`SIGUSR1`) plus the harness's tty, process-tree and CPU backstops. Without
-   an attestation the update waits for the next launch. **This never blocks on a person.** The
-   session keeps running on its build, nothing prompts, and nobody is asked. Under contract 3,
-   aterm sends the attestation itself (the next milestone).
+   read the screen itself. A move needs aterm's fresh idle/composer attestation under a proven
+   contract-3 claim, or an idle attestation (`SIGUSR1`) elsewhere, plus the harness's tty,
+   process-tree and CPU backstops. Without an attestation the update waits for the next launch.
+   **This never blocks on a person.** The session keeps running on its build, nothing prompts,
+   and nobody is asked.
 6. **A busy reading ends the attestation.** The harness does not retry on its own. A new
    attestation must come, so a flapping child cannot be stopped by persistence.
 7. **The session comes from Kimi's lock, and ambiguity refuses.** The session id is the one
@@ -258,9 +303,11 @@ Choices made without the owner, each fail-closed and reversible:
 12. **`--version` succeeds without a vendor.** It prints
     `kimi-alab <version> (kimi not installed)` (or `(kimi unknown)`, decision 18) and exits
     0, because it reports the harness's version. Only a run refuses.
-13. **No `unsafe`.** The crate is `#![forbid(unsafe_code)]` (`[lints.rust] unsafe_code =
-    "forbid"`). Every syscall goes through `rustix` and `signal-hook`. Trust's verified lanes
-    stop at an unmodeled FFI call, so an in-crate FFI call could never pass them.
+13. **`unsafe` is confined to descriptor ownership and native child-identity queries.** The crate
+    sets `unsafe_code = "deny"`; documented exceptions take sole ownership of the inherited
+    handoff descriptor and call `waitid`/`proc_pidinfo`/`proc_pidpath` for the kernel proof a
+    handoff needs. Every other syscall goes through `rustix` and `signal-hook`. Trust's verified
+    lanes stop at an unmodeled FFI call, so an in-crate FFI call could never pass them.
 14. **The publication gate is Trust's advisory lane** (`publish/config.sh`). The measured
     results are below. The publication engine admits `targo --unverified test` only beside a
     verified `targo trust check`, and the strict lane does not pass yet.
@@ -322,17 +369,30 @@ Choices made without the owner, each fail-closed and reversible:
     lock, the harness restores the saved terminal modes, marks the target build abandoned,
     journals `MOVE-FALLBACK`, and resumes the session preferring the previous working build
     before `current`.
+23. **Claim only the duties this build proves, and pass through otherwise (2026-11-06).** The
+    harness claims `relaunch,upgrade` under contract 3. It starts no child until aterm confirms the
+    claim as proven, and every host-driven move requires a fresh idle/composer read both when the
+    attestation opens and immediately before `SIGTERM`; the local terminal, process-tree and CPU
+    backstops still apply. Any startup or connection failure execs the vendor or holds the move,
+    never leaves a second supervisor of the same duty. The typing scopes remain unclaimed until
+    their own implementations and tests land.
+24. **Crash relaunch is proven from the running child and bounded (2026-11-06).** Only an abnormal
+    exit or fault qualifies, and only with a fresh proven relaunch claim and the session id most
+    recently proven by the running child's lock. A second crash within 15 s ends with the child's
+    status rather than forming a relaunch loop; a stable child re-arms relaunch after that grace.
+    Clean and intentional exits never take this branch.
 
 ## Verification status
 
-Measured 2026-10-24 on a clean clone of commit bd8547a (the sources this README ships
-with), with the gate exactly as `publish/config.sh` spells it, run step by step as the
-publication engine runs it (rustup `trust` toolchain, targo 0.10.0+g41d799797):
+First measured 2026-10-24 on a clean clone of commit bd8547a, with the gate exactly as
+`publish/config.sh` spells it, run step by step as the publication engine runs it (rustup `trust`
+toolchain, targo 0.10.0+g41d799797). The advisory Trust check, unverified tests, lint and
+formatting were rerun on this change on 2026-11-09:
 
 | Step | Result |
 |---|---|
-| `targo trust check --allow-l0-gaps` (verified, advisory lane) | exit 3, `Gate: COULD-NOT-RUN [advisory lane, exit 3]`. **0 refuted.** 266 functions: 113 rows proved, 185 runtime-checked, 247 unknown. |
-| `targo --unverified test` (no proof claim) | exit 0: 51 unit and 23 integration tests passed |
+| `targo trust check --allow-l0-gaps` (verified, advisory lane) | exit 3, `Gate: COULD-NOT-RUN [advisory lane, exit 3]`. **0 refuted.** 542 functions: 215 rows proved, 366 runtime-checked, 453 unknown. |
+| `targo --unverified test` (no proof claim) | exit 0: 65 unit and 35 integration tests passed |
 | `targo tippy -- -D warnings` (clippy pedantic) | exit 0 |
 | `targo fmt --check` | exit 0 |
 | `targo trust check` (strict lane, not the gate) | exit 1 on the same unknown rows; 0 refuted (measured on 64fd067, not rerun since) |
