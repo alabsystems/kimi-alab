@@ -5,6 +5,6 @@
 id        = "kimi-alab"
 tool      = "kimi-alab"
 leads     = ["kimi"]
-contracts = [3, 4]            # alab-wire claims at 4 where aterm serves it, else at 3
+contracts = [4]               # 4 alone, never 3: aterm.rs CONTRACTS, declared to alab-wire
 name      = "Kimi Code"
 env_strip = ["KIMI_", "MOONSHOT_"]

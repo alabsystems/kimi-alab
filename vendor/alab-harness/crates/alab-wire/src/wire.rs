@@ -553,6 +553,19 @@ impl Connection {
         self.poisoned = true;
     }
 
+    /// The socket and the bytes read past the last reply, for a caller that takes the
+    /// connection over once a verb has changed what it carries (`stream`, whose `OK` line is
+    /// followed by records). A connection an earlier exchange made unusable has none to give.
+    pub(crate) fn into_parts(self) -> io::Result<(UnixStream, Vec<u8>)> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "an earlier exchange failed; the connection cannot be taken over",
+            ));
+        }
+        Ok((self.stream, self.pending))
+    }
+
     fn begin(&mut self, request: &str) -> io::Result<Instant> {
         self.prepare(request)?;
         deadline_at(self.timeout, (self.clock)())
@@ -1728,16 +1741,17 @@ mod tests {
 
     #[test]
     fn the_event_descriptor_is_the_streams_and_polls_readable_only_with_something_to_drain() {
-        let readable = |fd: RawFd| {
+        let readable_within = |fd: RawFd, wait_ms: i32| {
             let mut probe = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: probe is one initialized live descriptor, and a zero timeout never waits.
-            let ready = unsafe { libc::poll(&raw mut probe, 1, 0) };
+            // SAFETY: probe is one initialized live descriptor, and the wait is bounded.
+            let ready = unsafe { libc::poll(&raw mut probe, 1, wait_ms) };
             ready > 0 && probe.revents & (libc::POLLIN | libc::POLLHUP) != 0
         };
+        let readable = |fd: RawFd| readable_within(fd, 0);
         let (mut events, mut peer) = subscribed(b"");
         let fd = events.as_raw_fd();
         assert_eq!(fd, events.stream.as_raw_fd());
@@ -1747,9 +1761,12 @@ mod tests {
         assert!(readable(fd));
         assert!(events.drain().activity);
         assert!(!readable(fd));
-        // The end of the stream is readable too, and the drain reports it.
+        // The end of the stream is readable too, and the drain reports it. The
+        // end comes once every copy of the peer is closed, and a process another
+        // test thread is starting holds one until its exec, so it is awaited.
         drop(peer);
-        assert!(readable(fd));
+        let end_ms = i32::try_from(END.as_millis()).unwrap();
+        assert!(readable_within(fd, end_ms));
         assert!(events.drain().ended);
     }
 

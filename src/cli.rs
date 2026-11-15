@@ -101,6 +101,9 @@ pub enum Command {
     Run {
         /// `--alab-no-update`: never move the child onto a new build.
         no_update: bool,
+        /// atpkg's `run --` envelope: a managed launch, which carries the launcher's blocks
+        /// ([`crate::launch`]) before the vendor starts.
+        managed: bool,
         /// The vendor's words, verbatim.
         args: Vec<OsString>,
     },
@@ -117,6 +120,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
         }
         return Ok(Command::Run {
             no_update: false,
+            managed: true,
             args: args.into_iter().skip(2).collect(),
         });
     }
@@ -144,6 +148,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Command, String> {
     }
     Ok(Command::Run {
         no_update,
+        managed: false,
         args: rest.collect(),
     })
 }
@@ -185,18 +190,28 @@ USAGE
 {NAME} runs the unmodified `{cmd}` from the atpkg store (never from PATH) as its child on
 this terminal, passes every argument through, and exits with the child's own status.
 
+Under `run --` it first does what atpkg's `{cmd}` launcher does: `{cmd} upgrade` and `{cmd}
+update` run `aterm pkg update {cmd}` when an executable `aterm` is on `PATH` (else {cmd} takes
+the words); `--no-harness` (or `--no-alab-harness`) ahead of `--` runs {cmd} in its place; a
+typed `--yolo` becomes `--auto`, and a launch that names no approval posture gets `--auto` in
+front (yolo by default) unless it leaves the harness out (`--no-harness` or
+`ATERM_NO_HARNESS=1`), the command as run printed on standard error.
+
 When atpkg makes a different {cmd} build current while the session runs, {NAME} waits for a
 safe point and resumes the same session on the new build (`{cmd} … --session <id>`) without
 exiting. A new {NAME} build crosses the same safe point by exec: the harness keeps its pid and
 the child runs on, with its session and account state carried to the new image. Under a proven
-aterm claim (scope=relaunch,upgrade, at contract 4 or 3), aterm's own idle and empty-composer
+aterm claim (scope=relaunch,upgrade, at contract 4), aterm's own idle and empty-composer
 status supplies the attestation. Elsewhere `kill -USR1 <{NAME} pid>` supplies it. Both then need
 {quiet} s with no keystroke read, nothing drawn, no process started or ended under {cmd}, and
-almost no CPU. A busy {cmd} is never stopped. If aterm cannot prove the claim with both duties
-(under contract 3, if its roster has no {NAME} row), {NAME} execs {cmd} in its place instead of
-leaving two supervisors. Under the claim, a {cmd} that crashes is resumed on its session by aterm's own rule
-(nobody typing, holding or driving the session) after 1 s, 10 s, 60 s, then 10 min, and a
-restart aterm asks for is made with SIGTERM, then SIGKILL if {cmd} does not end.
+almost no CPU. A busy {cmd} is never stopped. If aterm cannot prove the claim with both duties,
+or lists no contract 4 (the only one {NAME} claims under: it never claims 3), {NAME} execs
+{cmd} in its place instead of leaving two supervisors. While aterm serves no contract 4 later
+in the session (after it could not answer at launch, or once it stops serving 4), no claim is
+made, {cmd} runs on unclaimed and a crash is passed on, and the claim is made at 4 once aterm
+serves it again. Under the claim, a {cmd} that crashes is resumed on its session by aterm's
+own rule (nobody typing, holding or driving the session) after 1 s, 10 s, 60 s, then 10 min,
+and a restart aterm asks for is made with SIGTERM, then SIGKILL if {cmd} does not end.
 
 ENVIRONMENT
   KIMI_ALAB_PKG_PREFIX   the atpkg prefix (default: aterm.toml [packages] prefix, else
@@ -225,6 +240,7 @@ mod tests {
             parse(os(&["--version", "x"])).unwrap(),
             Command::Run {
                 no_update: false,
+                managed: false,
                 args: os(&["--version", "x"])
             }
         );
@@ -236,6 +252,7 @@ mod tests {
             parse(os(&["run", "--", "--version"])).unwrap(),
             Command::Run {
                 no_update: false,
+                managed: true,
                 args: os(&["--version"])
             }
         );
@@ -243,6 +260,7 @@ mod tests {
             parse(os(&["run", "--", "--alab-no-update", "", "a b"])).unwrap(),
             Command::Run {
                 no_update: false,
+                managed: true,
                 args: os(&["--alab-no-update", "", "a b"])
             }
         );
@@ -258,6 +276,7 @@ mod tests {
             parse(os(&["--alab-no-update", "-y", "--alab-which"])).unwrap(),
             Command::Run {
                 no_update: true,
+                managed: false,
                 args: os(&["-y", "--alab-which"])
             }
         );
@@ -265,6 +284,7 @@ mod tests {
             parse(os(&[])).unwrap(),
             Command::Run {
                 no_update: false,
+                managed: false,
                 args: vec![]
             }
         );

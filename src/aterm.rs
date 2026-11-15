@@ -2,18 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! kimi-alab's side of its link to aterm. The link itself is the shared library `alab-wire`
-//! (`vendor/alab-harness/crates/alab-wire`, the vendored alab-harness v0.1.0): the wire, the
-//! claim at contract 4 or 3 with its guards (the roster under contract 3, the scope read back),
-//! the [`Link`] state machine with its bounds and its busy-not-gone rule, aterm's exit judgement
+//! (`vendor/alab-harness/crates/alab-wire`, the vendored alab-harness v0.7.1): the wire, the
+//! claim with its guards (the scope read back) kept to the contracts the harness declares, the
+//! [`Link`] state machine with its bounds and its busy-not-gone rule, aterm's exit judgement
 //! and the crash ladder. This module holds only what is this harness's own: who it is to aterm
-//! ([`config`]), the variable that leaves it out ([`NO_HARNESS_ENV`]), the clock its link runs
-//! on ([`now_ms`]), what it claims for a child ([`child`]), how a move a person attested is
-//! checked against aterm's facts ([`unheld`]), and how the link's notes reach the journal
-//! ([`journal`]).
+//! ([`config`]), the contracts it declares ([`CONTRACTS`]) and what it does when aterm serves
+//! none of them ([`unserved`]), the variable that leaves it out ([`NO_HARNESS_ENV`]), the clock
+//! its link runs on ([`now_ms`]), what it claims for a child ([`child`]), how a move a person
+//! attested is checked against aterm's facts ([`unheld`]), and the link's notes as journal
+//! events ([`journal_notes`]).
 
 use std::ffi::OsString;
 
-use alab_wire::{Child, ChildProcess, Config, Facts, Link, SafePoint, Scope, Warrant};
+use alab_wire::{
+    Child, ChildProcess, Config, Contract, Facts, Failure, Link, SafePoint, Scope, Warrant,
+};
 
 use crate::env::Env;
 use crate::journal::Journal;
@@ -28,17 +31,34 @@ pub const VENDOR_WORD: &str = "kimi";
 pub const SCOPES: [Scope; 2] = [Scope::Relaunch, Scope::Upgrade];
 /// The variable that leaves the harness out of a launch.
 pub const NO_HARNESS_ENV: &str = "ATERM_NO_HARNESS";
+/// The contracts this build claims under, `contracts` in `alab-harness.toml` (a unit test holds
+/// the two and [`config`]'s declared list equal): contract 4 alone. A build that carries a
+/// record never claims 3 (aterm's harness interface design, section 2.2: contract 3 is the
+/// seed rows' alone), and a 3 in the record would keep aterm serving contract 3 for it.
+/// [`config`] declares this list to alab-wire (`Config::with_contracts`), whose every claim (the
+/// launch's, an adopted image's, each made again on the link's clock or after a policy switched
+/// back on) keeps to it: against an aterm that lists no 4 none is sent, the policy is read
+/// again every 5 s, and the claim is made at 4 once aterm serves it (README decision 41).
+pub const CONTRACTS: [Contract; 1] = [Contract::Four];
 
-/// Who this harness is to aterm.
+/// Who this harness is to aterm, claiming under [`CONTRACTS`] alone. The link stays on
+/// alab-wire's v0.1 path (`with_stream(false)`): a contract-4 claim is renewed with `meta set
+/// supervisor` and woken by the event subscription, and `stream` is never sent, since this
+/// harness answers none of the session stream's records yet (aterm tracker HX-19; README
+/// decision 40).
 ///
 /// # Panics
-/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] is not empty, and the
-/// build refuses a [`crate::cli::VERSION`] that is not `MAJOR.MINOR.0[+g<sha>]`
+/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] and [`CONTRACTS`] are not
+/// empty, and the build refuses a [`crate::cli::VERSION`] that is not `MAJOR.MINOR.0[+g<sha>]`
 /// (`cli::is_pack_version`), which is a claim's `version=`. The unit test makes this config.
 #[must_use]
 pub fn config() -> Config {
     Config::new(HOLDER_ID, VENDOR_WORD, &SCOPES, crate::cli::VERSION)
-        .expect("kimi-alab's id, vendor word, scopes and version are a config aterm reads")
+        .and_then(|config| config.with_contracts(&CONTRACTS))
+        .expect(
+            "kimi-alab's id, vendor word, scopes, version and contracts are a config aterm reads",
+        )
+        .with_stream(false)
 }
 
 /// Whether the person left the harness out (`ATERM_NO_HARNESS=1`).
@@ -144,10 +164,25 @@ pub fn unheld(facts: &Facts, holder: &str) -> Result<(), String> {
     }
 }
 
-/// Write the link's notes to the journal: `aterm <verb> <rest>` becomes the event `<VERB>` with
-/// `<rest>` (`aterm claimed holder=… contract=4 …` is `CLAIMED holder=… contract=4 …`). The last
-/// note's `<rest>`, when there was one.
-pub fn journal(link: &mut Link, journal: &mut Journal) -> Option<String> {
+/// Why no claim stands on `link`, when aterm's last answer to a claim attempt was that its
+/// policy lists none of [`CONTRACTS`] (alab-wire's `Failure::Unserved`, `policy contract=2,3
+/// declared=4`): no claim stands (alab-wire gave back any its re-exec grace kept) and none was
+/// sent at another contract, so no duty is taken from aterm's engine. A launch answered so runs
+/// Kimi in the harness's place; a crash while it stands, or one already waiting for aterm when it
+/// is read, is passed on at once, as with no claim, and a restart aterm asked for is refused.
+/// `None` while the link is held or absent, and on a link lost for any other reason.
+#[must_use]
+pub fn unserved(link: &Link) -> Option<&str> {
+    match link.unclaimed() {
+        Some(Failure::Unserved(why)) => Some(why),
+        _ => None,
+    }
+}
+
+/// What follows every step of the link: its notes go to the journal, `aterm <verb> <rest>` as
+/// the event `<VERB>` with `<rest>` (`aterm claimed holder=… contract=4 …` is `CLAIMED
+/// holder=… contract=4 …`). The last note's `<rest>`, when there was one.
+pub fn journal_notes(link: &mut Link, journal: &mut Journal) -> Option<String> {
     let mut last = None;
     for line in link.take_notes() {
         let rest = line.strip_prefix("aterm ").unwrap_or(&line);
@@ -169,6 +204,55 @@ mod tests {
         assert_eq!(config.vendor(), "kimi");
         assert_eq!(config.scopes(), [Scope::Relaunch, Scope::Upgrade]);
         assert_eq!(config.holder(77), "kimi-alab@77");
+        assert!(!config.streams(), "the session stream is HX-19's");
+    }
+
+    /// `alab-harness.toml` (the record aterm's registry reads), [`CONTRACTS`] and the contracts
+    /// the config declares to alab-wire say the same: 4 alone.
+    #[test]
+    fn the_record_and_the_claim_name_contract_4_alone() {
+        let record = include_str!("../alab-harness.toml");
+        let line = record
+            .lines()
+            .find(|line| line.trim_start().starts_with("contracts"))
+            .expect("alab-harness.toml names its contracts");
+        let value = line
+            .split_once('=')
+            .map(|(_, value)| value.split('#').next().unwrap_or("").trim())
+            .expect("contracts = [...]");
+        let config = config();
+        let declared = config
+            .contracts()
+            .iter()
+            .map(|contract| contract.number().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(value, format!("[{declared}]"));
+        assert_eq!(config.contracts(), CONTRACTS);
+        assert_eq!(CONTRACTS, [Contract::Four]);
+    }
+
+    /// alab-wire makes no claim text at a contract the config does not declare, so no claim at
+    /// 3 can be sent from this harness, whatever aterm serves; the claim at 4 is made.
+    /// NEGATIVE CONTROL: alab-wire's default contracts (3 and 4) make the claim at 3.
+    #[test]
+    fn no_claim_at_contract_3_can_be_made() {
+        const SID: &str = "s-4d7a2a97";
+        let kid = child(Some("2.3.1"), None, None);
+        let claim = |config: &Config, contract| {
+            alab_wire::claim::claim_verb(config, contract, SID, 77, kid)
+        };
+        let config = config();
+        assert_eq!(claim(&config, Contract::Three), None);
+        let four = claim(&config, Contract::Four).expect("a claim at 4");
+        assert!(
+            four.contains(" contract=4 scope=relaunch,upgrade "),
+            "{four}"
+        );
+        let default = Config::new(HOLDER_ID, VENDOR_WORD, &SCOPES, crate::cli::VERSION).unwrap();
+        assert_eq!(default.contracts(), Config::DEFAULT_CONTRACTS);
+        let three = claim(&default, Contract::Three).expect("the default claims at 3");
+        assert!(three.contains(" contract=3 "), "{three}");
     }
 
     #[test]

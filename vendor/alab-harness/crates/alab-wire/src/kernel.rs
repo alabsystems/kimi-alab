@@ -16,9 +16,9 @@
 //!   seconds and `starttime` whole ticks, so two readers can differ; aterm
 //!   matches it within one second plus a tick.
 //!
-//! This is the one process fact the library reads, and only when a harness
-//! asks ([`start_us`], [`ChildProcess::of`]); it still forks, execs, signals
-//! and reaps nothing.
+//! It is read only when a harness asks ([`start_us`], [`ChildProcess::of`]),
+//! and forks, execs, signals and reaps nothing. A re-exec reads more of the
+//! child: its kernel identity ([`crate::reexec::Identity`]).
 
 use std::io;
 

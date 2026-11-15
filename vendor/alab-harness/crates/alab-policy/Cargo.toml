@@ -1,0 +1,26 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# alab-policy: the deciders every ALab harness shares, moved out of aterm's
+# supervisor (aterm's harness interface design, section 3). They read only the
+# data they are handed: no dependencies, no unsafe code and no input or output
+# (clippy.toml bans the std doors to files, processes, the environment, the
+# network, the clock and sleep).
+
+[package]
+name = "alab-policy"
+description = "The deciders every ALab harness shares, moved out of aterm: pure functions of the readings they are handed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+# Items aterm's own tests read across the crate boundary (its `cfg(test)`
+# items before the move). This crate's own tests always have them; a consumer
+# turns this on only in its `[dev-dependencies]`.
+testing = []
+
+[lints]
+workspace = true

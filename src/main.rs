@@ -11,7 +11,7 @@ use kimi_alab::{
     cli::{self, Command, NAME},
     env::Env,
     journal::Journal,
-    kimi,
+    kimi, launch,
     store::{self, Build, Prefix, StoreError},
     supervise,
 };
@@ -69,19 +69,27 @@ fn which(env: &Env) {
         Err(e) => println!("kimi home unusable: {e}"),
     }
     println!(
-        "aterm     contract 4, else 3, scope={} claimed by {} when the host proves it",
+        "aterm     contract {}, scope={} claimed by {} when the host proves it",
+        aterm::config()
+            .contracts()
+            .iter()
+            .map(|contract| contract.number().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         alab_wire::claim::scope_words(&aterm::SCOPES),
         alab_wire::claim::holder(aterm::HOLDER_ID, std::process::id())
     );
 }
 
-/// Exec the vendor in place when aterm cannot prove this harness's claim, so no second supervisor
-/// stands between the tab and Kimi.
+/// Exec the vendor in place when aterm cannot prove this harness's claim, or the launch leaves
+/// the harness out, so no second supervisor stands between the tab and Kimi. A launch `env` says
+/// leaves the harness out hands the vendor `ATERM_NO_HARNESS=1`, as atpkg's launcher exports it.
 #[cfg(unix)]
 fn pass_through(
     build: &Build,
     args: &[std::ffi::OsString],
     depth: u32,
+    env: &Env,
     journal: &mut Journal,
     why: &str,
 ) -> ! {
@@ -97,6 +105,9 @@ fn pass_through(
     }
     for (key, value) in kimi::HARNESS_ENV {
         cmd.env(key, value);
+    }
+    if aterm::left_out(env) {
+        cmd.env(aterm::NO_HARNESS_ENV, "1");
     }
     cmd.env_remove(supervise::PID_ENV);
     cmd.env(supervise::DEPTH_ENV, depth.saturating_add(1).to_string());
@@ -130,8 +141,9 @@ fn unclaimable(env: &Env, args: &[std::ffi::OsString]) -> Option<String> {
     kimi::carried(&words).err().map(|why| why.to_string())
 }
 
-/// The launch's link to aterm (`alab-wire`): the policy, the roster guard under contract 3, the
-/// claim at the highest contract aterm serves, and its scope read back, made before the first
+/// The launch's link to aterm (`alab-wire`): the policy, which must serve contract 4 (the only
+/// one this build declares, [`aterm::CONTRACTS`]; alab-wire sends no claim otherwise and
+/// [`aterm::unserved`] says why), the claim, and its scope read back, made before the first
 /// child starts; or, for a child an earlier harness image ran, the same claim kept trying
 /// whatever aterm answers. `Err` is why the vendor runs in the harness's place instead.
 #[cfg(unix)]
@@ -155,7 +167,7 @@ fn claim(
                 u32::try_from(state.pid).ok(),
             );
             let mut link = Link::adopt_with(config, me, child, now, lookup);
-            aterm::journal(&mut link, journal);
+            aterm::journal_notes(&mut link, journal);
             return Ok(link);
         }
     };
@@ -164,9 +176,14 @@ fn claim(
     }
     let child = aterm::child(fresh.version.as_deref(), None, None);
     let mut link = Link::launch_with(config, me, child, now, lookup);
-    let last = aterm::journal(&mut link, journal);
+    let last = aterm::journal_notes(&mut link, journal);
     if link.is_absent() {
         return Err(last.unwrap_or_else(|| "aterm made no claim".to_string()));
+    }
+    if let Some(why) = aterm::unserved(&link) {
+        // aterm lists no contract 4 (`UNCLAIMED policy contract=2,3 declared=4`): nothing was
+        // claimed, and Kimi runs in the harness's place rather than wait for an aterm update.
+        return Err(why.to_string());
     }
     if link.judges() && !aterm::takes_both(&link) {
         let granted = aterm::granted(&link);
@@ -207,9 +224,51 @@ fn fresh_start(prefix: &std::path::Path) -> supervise::Start {
     supervise::Start::Fresh(build)
 }
 
-/// Run a fresh session, or adopt the child an earlier harness image carried through re-exec.
+/// THE LAUNCHER'S BLOCKS, in its order ([`launch`]), for a fresh launch through atpkg's `run --`
+/// envelope: a self-update word is handed to aterm's package manager, which replaces this
+/// process; Kimi has no sign-in gate; `--no-harness` and `--no-alab-harness` are taken off and
+/// leave the harness out (`ATERM_NO_HARNESS=1` in `env`); the yolo block decides the words and
+/// prints the command as run. The words to run, and whether a word left the harness out.
 #[cfg(unix)]
-fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
+fn managed_launch(
+    env: &mut Env,
+    prefix: &std::path::Path,
+    args: Vec<std::ffi::OsString>,
+) -> (Vec<std::ffi::OsString>, bool) {
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    if let Some(mut update) = launch::self_update(&args, env, prefix, std::process::id()) {
+        let error = update.exec();
+        eprintln!(
+            "{NAME}: cannot run {}: {error}",
+            update.get_program().to_string_lossy()
+        );
+        std::process::exit(if error.kind() == std::io::ErrorKind::NotFound {
+            127
+        } else {
+            126
+        });
+    }
+    let (args, by_word) = launch::strip_no_harness(args);
+    if by_word {
+        env.set(aterm::NO_HARNESS_ENV, std::ffi::OsStr::new("1"));
+    }
+    match launch::yolo(&args, aterm::left_out(env)) {
+        Some((run, line)) => {
+            // Best effort, as every line of the harness's own: a closed standard error never
+            // stops the launch.
+            let _ = std::io::stderr().write_all(&line);
+            (run, by_word)
+        }
+        None => (args, by_word),
+    }
+}
+
+/// Run a fresh session, or adopt the child an earlier harness image carried through re-exec. A
+/// fresh `managed` launch (atpkg's `run --`) first gets the launcher's blocks
+/// ([`managed_launch`]); an adopted child's words were decided when it started.
+#[cfg(unix)]
+fn run(env: &Env, no_update: bool, managed: bool, args: Vec<std::ffi::OsString>) -> ! {
     let handed = match kimi_alab::handoff::receive(env) {
         Ok(handed) => handed,
         Err(why) => {
@@ -219,24 +278,33 @@ fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
     };
     let mut run_env = env.clone();
     run_env.remove(kimi_alab::handoff::FD_ENV);
-    let env = &run_env;
     // Never run as the vendor of another kimi-alab, and never nest without bound: a store `kimi`
     // that leads back to this harness would otherwise start it again forever.
-    let depth =
-        match supervise::nesting(env, std::os::unix::process::parent_id(), std::process::id()) {
-            Ok(d) => d,
-            Err(why) => {
-                eprintln!("{NAME}: {why}");
-                std::process::exit(126);
-            }
-        };
-    let prefix = match store::resolve_prefix(env) {
+    let depth = match supervise::nesting(
+        &run_env,
+        std::os::unix::process::parent_id(),
+        std::process::id(),
+    ) {
+        Ok(d) => d,
+        Err(why) => {
+            eprintln!("{NAME}: {why}");
+            std::process::exit(126);
+        }
+    };
+    let prefix = match store::resolve_prefix(&run_env) {
         Ok(prefix) => prefix,
         Err(error) => {
             eprintln!("{NAME}: {error}");
             std::process::exit(127);
         }
     };
+    let (args, by_word) = if managed && handed.is_none() {
+        managed_launch(&mut run_env, &prefix.path, args)
+    } else {
+        (args, false)
+    };
+    let args = &args[..];
+    let env = &run_env;
     let start = if let Some(state) = handed {
         supervise::Start::Adopt(state)
     } else {
@@ -244,6 +312,19 @@ fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
     };
     let adopted = matches!(&start, supervise::Start::Adopt(_));
     let mut journal = Journal::open(env);
+    if by_word {
+        let supervise::Start::Fresh(build) = &start else {
+            unreachable!("only a fresh launch reads the launcher's words")
+        };
+        pass_through(
+            build,
+            args,
+            depth,
+            env,
+            &mut journal,
+            "--no-harness leaves the harness out",
+        );
+    }
     let link = if aterm::hosted(env, &aterm::config()) {
         if no_update && !adopted {
             let supervise::Start::Fresh(build) = &start else {
@@ -253,6 +334,7 @@ fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
                 build,
                 args,
                 depth,
+                env,
                 &mut journal,
                 "--alab-no-update leaves no upgrade duty",
             );
@@ -263,7 +345,7 @@ fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
                 let supervise::Start::Fresh(build) = &start else {
                     unreachable!("an adopted child's claim never fails")
                 };
-                pass_through(build, args, depth, &mut journal, &why)
+                pass_through(build, args, depth, env, &mut journal, &why)
             }
         }
     } else {
@@ -294,7 +376,11 @@ fn main() {
             println!("{}", cli::version_line(&current));
         }
         Command::Which => which(&env),
-        Command::Run { no_update, args } => run(&env, no_update, &args),
+        Command::Run {
+            no_update,
+            managed,
+            args,
+        } => run(&env, no_update, managed, args),
     }
 }
 

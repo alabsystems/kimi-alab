@@ -1,14 +1,17 @@
 # Copyright 2026 Andrew Yates
 # SPDX-License-Identifier: Apache-2.0
 #
-# alab-wire: an ALab harness's link to aterm. The wire, the contract-3 claim
-# with its guards, the link's state machine, aterm's exit judgement and the
-# crash ladder, and (feature `fake`) a fake aterm for consumers' tests. No
-# process supervision: nothing here forks, execs or signals a vendor.
+# alab-wire: an ALab harness's link to aterm. The wire, the contract-3 and
+# contract-4 claim with its guards, the link's state machine, aterm's exit
+# judgement and the crash ladder, the session stream's records and their codec,
+# the stream client the link drives, the `run` grammar aterm types to relaunch a
+# harness, the harness's re-exec of itself, and (feature `fake`) a fake aterm
+# for consumers' tests. No process supervision: nothing here forks, execs or
+# signals a vendor.
 
 [package]
 name = "alab-wire"
-description = "An ALab harness's link to aterm: wire, claim, link state machine, exit judgement and crash ladder"
+description = "An ALab harness's link to aterm: wire, claim, link, exit judgement, crash ladder, stream client, run grammar and re-exec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

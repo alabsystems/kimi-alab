@@ -53,7 +53,44 @@
 //! `ERR unproven` and nothing is stored, as aterm will answer it. Which wire
 //! text aterm gives a refused contract-4 claim is not designed yet; the fake's
 //! is its own.
+//!
+//! **The session stream.** [`FakeAterm::serve_stream`] serves `stream @<sid> v=1` on the
+//! connection that holds a contract-4 claim, as aterm does from HX-15b1 (the HX-15 plan's
+//! D4, D5 and D8) and sends its own records as it does from HX-15c. Until then the verb is
+//! answered [`STREAM_UNKNOWN`], as by every aterm before HX-15b1, and the connection stays in
+//! request mode with its claim; [`FakeAterm::set_stream_reply`] gives any other answer, such
+//! as `ERR busy streams`. A served stream answers `OK stream v=1 epoch=fake-<n> acked=<seq>
+//! in=<seq>`, then sends the current `hand` and a `policy` record, and acknowledges each
+//! harness record in order:
+//!
+//! * a line over [`crate::record::LINE_MAX`] is the next record, `dropped=bound`, unparsed;
+//! * a `seq` at or below `acked` is `dropped=applied`, and one past `acked + 1` is a gap,
+//!   which closes the stream;
+//! * a record over the budget ([`FakeAterm::set_stream_rate`]: [`crate::record::RATE_BURST`]
+//!   at once, [`crate::record::RATE_PER_S`] a second) is `dropped=rate`, and one the claim's
+//!   grant does not cover ([`Body::admitted`], with no act table: an act by a rule is never
+//!   covered) `dropped=scope`;
+//! * a `claim` record is a claim placement (D7): the fake builds `meta set supervisor <holder>
+//!   contract=4 …` from its words, the standing claim's for any it leaves out, and serves it on
+//!   the stream's connection; a refusal is `dropped=refused:<the ERR word>`, and an `OK` is
+//!   followed by a `policy` record, since the fake's revision moves with every claim;
+//! * every other record is acknowledged with no `dropped=`, and `took` and `refused` are kept
+//!   for a test to read ([`FakeAterm::took`], [`FakeAterm::refused`]).
+//!
+//! The stream's `acked` and `in` are the claimant's and outlive a stream that closed, as they
+//! do through aterm's re-exec grace; an aterm restart ([`FakeAterm::restart`]) moves the epoch
+//! and forgets them. A claim goes with the connection that made it, unless
+//! [`FakeAterm::set_reexec_grace`] keeps a contract-4 claim through the grace (D28), which the
+//! same holder's claim renews and [`FakeAterm::end_grace`] ends, forgetting the numbers. A policy
+//! move, a cap and a restart are sent both as the event they were and, while a stream is open,
+//! as a record, unless [`FakeAterm::set_stream_own_records`] makes it an aterm with HX-15b1
+//! alone, which sends none, and [`FakeAterm::set_stream_applies_claims`] one that acknowledges a
+//! `claim` record without placing it (D9). Each stream writes from its own thread, outside the
+//! fake's lock, and its rate budget is full at each open. A stream is closed by
+//! [`FakeAterm::close_stream`] (as aterm closes one on a gap or a claim placed elsewhere), by a
+//! release, by a claim made on another connection, and by a restart.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::Shutdown;
@@ -61,11 +98,15 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::claim::{Contract, Scope};
+use crate::claim::{Contract, Restart, Scope};
 use crate::config::{Config, EnvNames};
+use crate::record::{
+    Body, Composer, Dropped, LINE_MAX, RATE_BURST, RATE_PER_S, Record, STREAM_VERSION,
+};
 use crate::wire::Locator;
 
 /// The token every connection must present.
@@ -147,6 +188,214 @@ fn usage_4(why: &str) -> String {
         "ERR usage: meta set supervisor <id>@<pid> contract=4 scope=<word>[,<word>…] \
          version=<v> [vendor=<v>] [child=<pid>:<start>] [login=<account>]: {why}"
     )
+}
+
+/// What an aterm before HX-15b1 answers `stream @<sid> v=1`: a verb it does not know.
+pub const STREAM_UNKNOWN: &str = "ERR unknown verb";
+
+/// A token bucket: `burst` records at once, `per_s` more each second.
+#[derive(Debug)]
+struct Bucket {
+    burst: u64,
+    per_s: u64,
+    /// Thousandths of a record.
+    milli: u64,
+    since: Instant,
+}
+
+impl Bucket {
+    fn new(burst: u32, per_s: u32) -> Self {
+        Self {
+            burst: u64::from(burst),
+            per_s: u64::from(per_s),
+            milli: u64::from(burst) * 1_000,
+            since: Instant::now(),
+        }
+    }
+
+    /// Spend one record, if the budget holds one.
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = u64::try_from(now.duration_since(self.since).as_millis()).unwrap_or(u64::MAX);
+        self.since = now;
+        self.milli = self
+            .milli
+            .saturating_add(elapsed.saturating_mul(self.per_s))
+            .min(self.burst * 1_000);
+        if self.milli < 1_000 {
+            return false;
+        }
+        self.milli -= 1_000;
+        true
+    }
+}
+
+/// Milliseconds since 1970, for the `ms` of the fake's own records (only shown).
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// The session stream as aterm serves it: its knobs, the claimant's numbers, the open stream and
+/// what was read on it.
+#[derive(Debug)]
+struct Streams {
+    /// Whether `stream @<sid> v=1` is served; otherwise it is answered [`STREAM_UNKNOWN`].
+    serve: bool,
+    /// A whole reply sent in place of the stream's `OK`, the connection kept in request mode.
+    reply: Option<String>,
+    /// The aterm instance: the stream's `epoch=fake-<n>`.
+    epoch: u64,
+    /// Whose numbers `acked` and `sent` are: the claimant that last opened a stream.
+    holder: Option<String>,
+    /// The last harness record acknowledged.
+    acked: u64,
+    /// The last record the fake sent on a stream (`in`).
+    sent: u64,
+    /// The open stream: its connection, the socket (to shut it down), and the queue its own
+    /// writer thread writes from, in order, outside the state's lock.
+    open: Option<(u64, UnixStream, Sender<String>)>,
+    /// How many `stream` requests were answered, whatever the answer.
+    asked: usize,
+    /// The connection each stream was opened on, in order.
+    opened: Vec<u64>,
+    /// Every harness record read, applied or not, in arrival order.
+    records: Vec<Record>,
+    /// Every acknowledgement sent: the `seq` and its `dropped=`.
+    acks: Vec<(u64, Option<Dropped>)>,
+    /// The `in` of every `took` read.
+    took: Vec<u64>,
+    /// The `in` and `why` of every `refused` read.
+    refused: Vec<(u64, String)>,
+    /// Whether lines are read and dropped unacknowledged, as by a reader that stopped.
+    deaf: bool,
+    /// Reasons the next harness records are acknowledged with, applying nothing.
+    drop_next: VecDeque<Dropped>,
+    /// The rate budget of the stream now open: `rate_burst` and `rate_per_s`, full at each open.
+    rate: Bucket,
+    /// The burst of each stream's rate budget.
+    rate_burst: u32,
+    /// The refill of each stream's rate budget, a second.
+    rate_per_s: u32,
+    /// Whether the fake sends records of its own (HX-15c): the current `hand` and a `policy`
+    /// at every open, `policy` on a policy move or a placement, `restart` with every restart.
+    own_records: bool,
+    /// Whether a `claim` record is placed as a claim (HX-15b2), or acknowledged and not applied,
+    /// as by an aterm with HX-15b1 alone (D9).
+    applies_claims: bool,
+    /// `claim` records acknowledged and not applied.
+    unapplied: usize,
+    /// Whether a contract-4 claim whose connection closed is kept until [`FakeAterm::end_grace`],
+    /// as through aterm's re-exec grace (D28).
+    grace: bool,
+    /// The person's hand: `human_seq`, the composer and the halt.
+    hand: (u64, Composer, bool),
+}
+
+impl Streams {
+    fn new() -> Self {
+        Self {
+            serve: false,
+            reply: None,
+            epoch: 1,
+            holder: None,
+            acked: 0,
+            sent: 0,
+            open: None,
+            asked: 0,
+            opened: Vec::new(),
+            records: Vec::new(),
+            acks: Vec::new(),
+            took: Vec::new(),
+            refused: Vec::new(),
+            deaf: false,
+            drop_next: VecDeque::new(),
+            rate: Bucket::new(RATE_BURST, RATE_PER_S),
+            rate_burst: RATE_BURST,
+            rate_per_s: RATE_PER_S,
+            own_records: true,
+            applies_claims: true,
+            unapplied: 0,
+            grace: false,
+            hand: (0, Composer::Empty, false),
+        }
+    }
+
+    /// Queue `line` and its newline for the open stream's writer. Whether one was open.
+    fn write(&self, line: &str) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|(_, _, out)| out.send(format!("{line}\n")).is_ok())
+    }
+
+    /// Send one of aterm's records on the open stream, numbered in `in`. Whether one was open.
+    fn emit(&mut self, body: Body) -> bool {
+        if self.open.is_none() {
+            return false;
+        }
+        self.sent += 1;
+        let record = Record {
+            seq: self.sent,
+            ms: wall_ms(),
+            body,
+        };
+        if let Ok(line) = record.line() {
+            self.write(&line);
+        }
+        true
+    }
+
+    /// [`Streams::emit`] for a record the fake sends of its own accord, which an aterm without
+    /// HX-15c does not send ([`FakeAterm::set_stream_own_records`]).
+    fn emit_own(&mut self, body: Body) -> bool {
+        self.own_records && self.emit(body)
+    }
+
+    /// Acknowledge harness record `seq`, moving `acked` to it.
+    fn ack(&mut self, seq: u64, dropped: Option<Dropped>) {
+        self.acked = self.acked.max(seq);
+        self.acks.push((seq, dropped.clone()));
+        let _ = self.emit_ack(seq, dropped);
+    }
+
+    /// Write an acknowledgement: it is not counted in `in`.
+    fn emit_ack(&self, seq: u64, dropped: Option<Dropped>) -> bool {
+        let record = Record {
+            seq,
+            ms: wall_ms(),
+            body: Body::Ack { dropped },
+        };
+        record.line().is_ok_and(|line| self.write(&line))
+    }
+
+    /// Close the open stream: its connection is shut down, which ends its writer, and a claim
+    /// bound to it goes.
+    fn close(&mut self) {
+        if let Some((_, out, _)) = self.open.take() {
+            let _ = out.shutdown(Shutdown::Both);
+        }
+    }
+
+    /// Forget the claimant's numbers, as aterm does when the claim they belong to ends.
+    fn forget(&mut self) {
+        self.holder = None;
+        self.acked = 0;
+        self.sent = 0;
+    }
+}
+
+/// The word after `ERR` in a refusal, as `dropped=refused:<word>` names it.
+fn refusal_word(reply: &str) -> String {
+    reply
+        .split_ascii_whitespace()
+        .nth(1)
+        .map(|word| word.trim_end_matches(':'))
+        .filter(|word| crate::record::is_word(word) && !word.contains(':'))
+        .unwrap_or("refused")
+        .to_string()
 }
 
 /// The words of one `meta set supervisor <holder> …` request, read as aterm's
@@ -278,7 +527,7 @@ struct State {
     events: Vec<String>,
     connections: u64,
     /// Every accepted connection, so [`FakeAterm::restart`] can drop them.
-    streams: Vec<UnixStream>,
+    accepted: Vec<UnixStream>,
     /// How many times [`FakeAterm::end_events`] ended every event stream: a
     /// stream that began at another count ends at its next look.
     events_ended: u64,
@@ -309,13 +558,20 @@ struct State {
     /// ([`FakeAterm::set_registered`]); one without is answered
     /// [`UNPROVEN_4`] and nothing is stored.
     registered: bool,
+    /// Every addressed request with the connection it came on, in arrival order.
+    requests: Vec<(u64, String)>,
+    /// The session stream.
+    streams: Streams,
 }
 
 impl State {
+    /// Drop the standing claim, and the stream it opened with it (the plan's D23: a release
+    /// closes the stream).
     fn release(&mut self) {
         if self.claim.take().is_some() {
             self.revision += 1;
         }
+        self.streams.close();
     }
 
     /// The policy body as aterm would answer it now: a halt on the session
@@ -365,11 +621,214 @@ impl State {
             .unwrap_or_default()
     }
 
-    /// The policy cell moved: a new generation, said on every subscription.
+    /// The policy cell moved: a new generation, said on every subscription and, as a `policy`
+    /// record, on an open stream (HX-15c).
     fn policy_moved(&mut self) {
         self.generation += 1;
         let line = format!("EVENT 1 harness-policy gen={}", self.generation);
         self.events.push(line);
+        self.streams.emit_own(Body::Policy);
+    }
+
+    /// `restart <words>`: said on every subscription and, as a `restart` record, on an open
+    /// stream (HX-15c sends one for every restart row while the stream is open).
+    fn restart_asked(&mut self, words: &str) {
+        self.events.push(format!("EVENT 1 restart {words}"));
+        if let Some(restart) = Restart::parse(words.split_ascii_whitespace()) {
+            self.streams.emit_own(Body::Restart {
+                cause: restart.cause,
+                account: restart.account,
+                model: restart.model,
+            });
+        }
+    }
+
+    /// `stream @<sid> v=1` on connection `id`, which answers on `out`: whether the stream
+    /// opened. A refusal is written here and the connection stays in request mode.
+    fn open_stream(&mut self, id: u64, request: &str, sid: &str, out: &mut UnixStream) -> bool {
+        self.streams.asked += 1;
+        let refusal = if let Some(reply) = &self.streams.reply {
+            Some(reply.clone())
+        } else if !self.streams.serve {
+            Some(STREAM_UNKNOWN.to_string())
+        } else if request != format!("stream @{sid} v={STREAM_VERSION}") {
+            Some("ERR usage: stream @<sid> v=1".to_string())
+        } else if !self.claim.as_ref().is_some_and(|claim| {
+            claim.connection == id && claim.words.contract.as_deref() == Some("4")
+        }) {
+            Some("ERR usage: stream: no contract 4 claim on this connection".to_string())
+        } else {
+            None
+        };
+        let (shut, mut writer) = match refusal {
+            Some(reply) => {
+                let _ = out.write_all(format!("{reply}\n").as_bytes());
+                return false;
+            }
+            None => match (out.try_clone(), out.try_clone()) {
+                (Ok(shut), Ok(writer)) => (shut, writer),
+                _ => {
+                    let _ = out.write_all(b"ERR busy streams\n");
+                    return false;
+                }
+            },
+        };
+        let holder = self.claim.as_ref().map(|claim| claim.words.holder.clone());
+        if self.streams.holder != holder {
+            self.streams.forget();
+            self.streams.holder = holder;
+        }
+        self.streams.close();
+        let streams = &mut self.streams;
+        let reply = format!(
+            "OK stream v={STREAM_VERSION} epoch=fake-{} acked={} in={}\n",
+            streams.epoch, streams.acked, streams.sent
+        );
+        if out.write_all(reply.as_bytes()).is_err() {
+            return false;
+        }
+        // Each stream writes from its own thread, outside the state's lock: a client that stops
+        // reading holds up its own stream, never the fake. Shutting the socket down ends it.
+        let (queue, lines) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in lines {
+                if writer.write_all(line.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        streams.open = Some((id, shut, queue));
+        streams.opened.push(id);
+        streams.rate = Bucket::new(streams.rate_burst, streams.rate_per_s);
+        let (human_seq, composer, hold) = streams.hand;
+        streams.emit_own(Body::Hand {
+            human_seq,
+            composer,
+            hold,
+        });
+        streams.emit_own(Body::Policy);
+        true
+    }
+
+    /// One line read on the stream of connection `id`, without its newline.
+    fn stream_line(&mut self, id: u64, line: &[u8]) {
+        if self
+            .streams
+            .open
+            .as_ref()
+            .is_none_or(|(open, _, _)| *open != id)
+            || self.streams.deaf
+        {
+            return;
+        }
+        let next = self.streams.acked + 1;
+        if line.len() > LINE_MAX {
+            self.streams.ack(next, Some(Dropped::Bound));
+            return;
+        }
+        let Ok(decoded) = Record::read(line) else {
+            self.streams
+                .ack(next, Some(Dropped::Refused("usage".to_string())));
+            return;
+        };
+        let record = decoded.record;
+        if record.seq <= self.streams.acked {
+            self.streams.acks.push((record.seq, Some(Dropped::Applied)));
+            let _ = self.streams.emit_ack(record.seq, Some(Dropped::Applied));
+            return;
+        }
+        if record.seq > next {
+            // A gap: aterm closes the stream, and the harness sends again from `acked`.
+            self.streams.close();
+            return;
+        }
+        self.streams.records.push(record.clone());
+        let granted = self
+            .claim
+            .as_ref()
+            .map(|claim| claim.scopes.clone())
+            .unwrap_or_default();
+        let dropped = if let Some(dropped) = self.streams.drop_next.pop_front() {
+            Some(dropped)
+        } else if !self.streams.rate.take() {
+            Some(Dropped::Rate)
+        } else if !record.body.admitted(&granted, |_| None) {
+            Some(Dropped::Scope)
+        } else {
+            None
+        };
+        if dropped.is_some() {
+            self.streams.ack(record.seq, dropped);
+            return;
+        }
+        match record.body {
+            Body::Claim { .. } if !self.streams.applies_claims => {
+                self.streams.unapplied += 1;
+                self.streams.ack(record.seq, None);
+            }
+            Body::Claim { .. } => {
+                let reply = self.claim_record(id, &record.body);
+                if reply == "OK" || reply.starts_with("OK ") {
+                    self.streams.ack(record.seq, None);
+                    // The fake's revision moves with every claim: read the grant again.
+                    self.streams.emit_own(Body::Policy);
+                } else {
+                    let word = refusal_word(&reply);
+                    self.streams.ack(record.seq, Some(Dropped::Refused(word)));
+                }
+            }
+            Body::Took { of } => {
+                self.streams.took.push(of);
+                self.streams.ack(record.seq, None);
+            }
+            Body::Refused { of, ref why } => {
+                self.streams.refused.push((of, why.clone()));
+                self.streams.ack(record.seq, None);
+            }
+            _ => self.streams.ack(record.seq, None),
+        }
+    }
+
+    /// A `claim` record served as the claim placement it is (D7): the line aterm builds from its
+    /// words, the standing claim's for any it leaves out, served on the stream's connection.
+    fn claim_record(&mut self, id: u64, body: &Body) -> String {
+        let Body::Claim {
+            child,
+            scope,
+            version,
+            vendor,
+            login,
+        } = body
+        else {
+            return "ERR usage".to_string();
+        };
+        let (Some(holder), Some(standing)) = (
+            self.streams.holder.clone(),
+            self.claim.as_ref().map(|claim| claim.words.clone()),
+        ) else {
+            return "ERR usage: no claim stands".to_string();
+        };
+        let scope = scope.as_ref().map_or_else(
+            || standing.scope.clone().unwrap_or_default(),
+            |scope| crate::claim::scope_words(scope),
+        );
+        let mut line = format!("{holder} contract=4 scope={scope}");
+        for (key, value) in [
+            ("version", version.clone().or(standing.version)),
+            ("vendor", vendor.clone().or(standing.vendor)),
+            (
+                "child",
+                child
+                    .and_then(crate::claim::ChildProcess::word)
+                    .or(standing.child),
+            ),
+            ("login", login.clone().or(standing.login)),
+        ] {
+            if let Some(value) = value {
+                line.push_str(&format!(" {key}={value}"));
+            }
+        }
+        self.claim(id, &line)
     }
 
     fn status_line(&self) -> String {
@@ -475,6 +934,15 @@ impl State {
         };
         self.claim = Some(claim);
         self.revision += 1;
+        // A claim placed on another connection closes the stream (HX-15b1).
+        if self
+            .streams
+            .open
+            .as_ref()
+            .is_some_and(|(open, _, _)| *open != id)
+        {
+            self.streams.close();
+        }
         if let Some(cap) = self.cap_after_claim.take() {
             self.cap(cap);
         }
@@ -527,6 +995,7 @@ impl State {
     /// One addressed request from connection `id`.
     fn answer(&mut self, id: u64, verb: &str) -> String {
         self.verbs.push(verb.to_string());
+        self.requests.push((id, verb.to_string()));
         self.witnessed
             .push(self.witness.as_ref().is_some_and(|path| path.exists()));
         if verb == "harness policy" {
@@ -729,7 +1198,7 @@ impl FakeAterm {
             subscriptions: 0,
             events: Vec::new(),
             connections: 0,
-            streams: Vec::new(),
+            accepted: Vec::new(),
             events_ended: 0,
             delay: Duration::ZERO,
             witness: None,
@@ -740,6 +1209,8 @@ impl FakeAterm {
             cap_after_claim: None,
             unstored: Vec::new(),
             status_reply: None,
+            requests: Vec::new(),
+            streams: Streams::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let (accept_state, accept_stop, accept_sid) =
@@ -757,7 +1228,7 @@ impl FakeAterm {
                     continue;
                 }
                 if let Ok(clone) = stream.try_clone() {
-                    lock(&accept_state).streams.push(clone);
+                    lock(&accept_state).accepted.push(clone);
                 }
                 let (state, stop, sid) = (
                     Arc::clone(&accept_state),
@@ -1060,7 +1531,7 @@ impl FakeAterm {
     /// which aterm sends instead of signalling a harness whose proven claim
     /// takes `relaunch`.
     pub fn send_restart(&self, cause: &str) {
-        self.event(&format!("restart cause={cause}"));
+        lock(&self.state).restart_asked(&format!("cause={cause}"));
     }
 
     /// Move the claim holder to another account, as aterm's account pool does
@@ -1072,24 +1543,27 @@ impl FakeAterm {
             || "-".to_string(),
             |home| percent_encode(home.as_os_str().as_encoded_bytes()),
         );
-        self.event(&format!("restart cause={cause} to={label} home={home}"));
+        lock(&self.state).restart_asked(&format!("cause={cause} to={label} home={home}"));
     }
 
     /// Move the claim holder to another model, as aterm does from HX-06:
     /// `EVENT 1 restart cause=<cause> model=<model>`. aterm names the model in
     /// `model=`, never in `to=`.
     pub fn send_model_restart(&self, cause: &str, model: &str) {
-        self.event(&format!("restart cause={cause} model={model}"));
+        lock(&self.state).restart_asked(&format!("cause={cause} model={model}"));
     }
 
     /// An aterm restart: every connection is dropped, and the claim with them.
-    /// The socket keeps listening, as a restarted aterm's does.
+    /// The socket keeps listening, as a restarted aterm's does. The new
+    /// instance is a new stream epoch that knows no claimant's `acked` or `in`.
     pub fn restart(&self) {
         let mut state = lock(&self.state);
         state.release();
-        for stream in state.streams.drain(..) {
+        for stream in state.accepted.drain(..) {
             let _ = stream.shutdown(Shutdown::Both);
         }
+        state.streams.epoch += 1;
+        state.streams.forget();
     }
 
     /// End every event stream now open, as aterm's event fan-out can drop a
@@ -1185,12 +1659,224 @@ impl FakeAterm {
     pub fn subscriptions(&self) -> usize {
         lock(&self.state).subscriptions
     }
+
+    /// Every addressed request so far with the connection it came on (connections are numbered
+    /// from 1 as they are accepted), without its `@<sid> `, in arrival order.
+    #[must_use]
+    pub fn requests(&self) -> Vec<(u64, String)> {
+        lock(&self.state).requests.clone()
+    }
+
+    /// The connection the standing claim is bound to.
+    #[must_use]
+    pub fn claim_connection(&self) -> Option<u64> {
+        lock(&self.state)
+            .claim
+            .as_ref()
+            .map(|claim| claim.connection)
+    }
+
+    // ───────────────────────────── the session stream ─────────────────────────────
+
+    /// Whether `stream @<sid> v=1` is served on the connection holding a contract-4 claim (as by
+    /// aterm from HX-15b1), or answered [`STREAM_UNKNOWN`], as by every aterm before it (at
+    /// first).
+    pub fn serve_stream(&self, serve: bool) {
+        lock(&self.state).streams.serve = serve;
+    }
+
+    /// Answer `stream` with exactly `reply`, the connection kept in request mode with its claim
+    /// (`None`: as [`FakeAterm::serve_stream`] says). `ERR busy streams` is what aterm answers
+    /// when its stream pool is full.
+    pub fn set_stream_reply(&self, reply: Option<&str>) {
+        lock(&self.state).streams.reply = reply.map(str::to_string);
+    }
+
+    /// The stream's rate budget: `burst` records at once and `per_s` more each second (aterm's
+    /// is [`RATE_BURST`] and [`RATE_PER_S`]). A record over it is acknowledged `dropped=rate`.
+    pub fn set_stream_rate(&self, burst: u32, per_s: u32) {
+        let streams = &mut lock(&self.state).streams;
+        (streams.rate_burst, streams.rate_per_s) = (burst, per_s);
+        streams.rate = Bucket::new(burst, per_s);
+    }
+
+    /// Acknowledge the next harness record `dropped=<dropped>`, applying nothing, whatever it
+    /// is. Each call stages one more.
+    pub fn drop_next_record(&self, dropped: Dropped) {
+        lock(&self.state).streams.drop_next.push_back(dropped);
+    }
+
+    /// Whether the open stream's lines are read and dropped unacknowledged, as by an aterm whose
+    /// stream reader stopped: `acked` stays where it was.
+    pub fn set_stream_deaf(&self, deaf: bool) {
+        lock(&self.state).streams.deaf = deaf;
+    }
+
+    /// Whether the fake sends records of its own, as aterm does from HX-15c (at first): the
+    /// current `hand` and a `policy` at every open, `policy` on every policy move and placement,
+    /// `restart` beside every restart event. With `false` it sends none, as an aterm with HX-15b1
+    /// alone, whose policy moves and restarts come only as events; [`FakeAterm::send_record`]
+    /// still sends what a test names.
+    pub fn set_stream_own_records(&self, send: bool) {
+        lock(&self.state).streams.own_records = send;
+    }
+
+    /// Whether a `claim` record is placed as a claim, as aterm does from HX-15b2 (at first), or
+    /// acknowledged with no `dropped=` and not applied, as an aterm with HX-15b1 alone does with
+    /// a kind it does not apply yet (D9).
+    pub fn set_stream_applies_claims(&self, applies: bool) {
+        lock(&self.state).streams.applies_claims = applies;
+    }
+
+    /// How many `claim` records were acknowledged and not applied.
+    #[must_use]
+    pub fn unapplied_claims(&self) -> usize {
+        lock(&self.state).streams.unapplied
+    }
+
+    /// Whether a contract-4 claim whose connection closes is kept, unbound, through aterm's
+    /// re-exec grace (D28) until [`FakeAterm::end_grace`] (at first, no: the claim goes with its
+    /// connection). A claim by the same holder renews it and keeps the stream's numbers; `meta
+    /// unset supervisor` from any connection releases it at once.
+    pub fn set_reexec_grace(&self, grace: bool) {
+        lock(&self.state).streams.grace = grace;
+    }
+
+    /// The re-exec grace ends: a claim kept unbound is released, and its claimant's stream
+    /// numbers are forgotten, so the same holder's next stream starts at `acked=0 in=0`.
+    pub fn end_grace(&self) {
+        let mut state = lock(&self.state);
+        if state
+            .claim
+            .as_ref()
+            .is_some_and(|claim| claim.connection == 0)
+        {
+            state.release();
+            state.streams.forget();
+        }
+    }
+
+    /// Whether the standing claim is kept unbound through the re-exec grace.
+    #[must_use]
+    pub fn in_grace(&self) -> bool {
+        lock(&self.state)
+            .claim
+            .as_ref()
+            .is_some_and(|claim| claim.connection == 0)
+    }
+
+    /// Write `line`, as it is, on the open stream, counted in nothing: a line a test makes,
+    /// such as one aterm would never send. Whether a stream was open.
+    pub fn send_line(&self, line: &str) -> bool {
+        lock(&self.state).streams.write(line)
+    }
+
+    /// Close the open stream, as aterm does on a `seq` gap or a claim placed on another
+    /// connection: its connection is shut down, and the claim bound to it goes.
+    pub fn close_stream(&self) {
+        lock(&self.state).streams.close();
+    }
+
+    /// A person's hand moved: send `hand` on the open stream with these values, which the next
+    /// stream to open is sent too. Whether a stream was open.
+    pub fn send_hand(&self, human_seq: u64, composer: Composer, hold: bool) -> bool {
+        let mut state = lock(&self.state);
+        state.streams.hand = (human_seq, composer, hold);
+        state.streams.emit_own(Body::Hand {
+            human_seq,
+            composer,
+            hold,
+        })
+    }
+
+    /// Send one of aterm's records on the open stream, numbered in its `in` (any body: `want`,
+    /// `prompt`, a kind the harness does not know). Whether a stream was open.
+    pub fn send_record(&self, body: Body) -> bool {
+        lock(&self.state).streams.emit(body)
+    }
+
+    /// Whether a stream is open now.
+    #[must_use]
+    pub fn streaming(&self) -> bool {
+        lock(&self.state).streams.open.is_some()
+    }
+
+    /// The connection the open stream is on.
+    #[must_use]
+    pub fn stream_connection(&self) -> Option<u64> {
+        lock(&self.state)
+            .streams
+            .open
+            .as_ref()
+            .map(|(id, _, _)| *id)
+    }
+
+    /// How many `stream` requests were answered, whatever the answer.
+    #[must_use]
+    pub fn stream_requests(&self) -> usize {
+        lock(&self.state).streams.asked
+    }
+
+    /// The connection each stream was opened on, in order.
+    #[must_use]
+    pub fn streams_opened(&self) -> Vec<u64> {
+        lock(&self.state).streams.opened.clone()
+    }
+
+    /// The stream's epoch word now, `fake-<n>`.
+    #[must_use]
+    pub fn epoch(&self) -> String {
+        format!("fake-{}", lock(&self.state).streams.epoch)
+    }
+
+    /// The last harness record acknowledged, and the last record the fake sent (`in`).
+    #[must_use]
+    pub fn stream_numbers(&self) -> (u64, u64) {
+        let state = lock(&self.state);
+        (state.streams.acked, state.streams.sent)
+    }
+
+    /// Every harness record read on a stream, applied or dropped (not those acknowledged
+    /// `dropped=applied`), in arrival order.
+    #[must_use]
+    pub fn stream_records(&self) -> Vec<Record> {
+        lock(&self.state).streams.records.clone()
+    }
+
+    /// Every acknowledgement sent: the harness record's `seq` and its `dropped=`.
+    #[must_use]
+    pub fn acks(&self) -> Vec<(u64, Option<Dropped>)> {
+        lock(&self.state).streams.acks.clone()
+    }
+
+    /// The `in` of every `took` the harness sent.
+    #[must_use]
+    pub fn took(&self) -> Vec<u64> {
+        lock(&self.state).streams.took.clone()
+    }
+
+    /// The `in` and `why` of every `refused` the harness sent.
+    #[must_use]
+    pub fn refused(&self) -> Vec<(u64, String)> {
+        lock(&self.state).streams.refused.clone()
+    }
+
+    /// How many `beat` records arrived.
+    #[must_use]
+    pub fn beats(&self) -> usize {
+        lock(&self.state)
+            .streams
+            .records
+            .iter()
+            .filter(|record| record.body == Body::Beat)
+            .count()
+    }
 }
 
 impl Drop for FakeAterm {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for stream in lock(&self.state).streams.drain(..) {
+        for stream in lock(&self.state).accepted.drain(..) {
             let _ = stream.shutdown(Shutdown::Both);
         }
         let _ = std::fs::remove_dir_all(&self.sock_dir);
@@ -1200,14 +1886,15 @@ impl Drop for FakeAterm {
     }
 }
 
-/// Stream the events pushed after this subscription began, until the client
-/// goes, the fake stops, a restart drops the connection, or
-/// [`FakeAterm::end_events`] ends it.
-fn stream_events(mut out: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
-    let (mut sent, ended) = {
-        let state = lock(state);
-        (state.events.len(), state.events_ended)
-    };
+/// Stream the events pushed after this subscription began (`start`: the events pushed and the
+/// ends counted before its ACK), until the client goes, the fake stops, a restart drops the
+/// connection, or [`FakeAterm::end_events`] ends it.
+fn stream_events(
+    mut out: UnixStream,
+    state: &Mutex<State>,
+    stop: &AtomicBool,
+    (mut sent, ended): (usize, u64),
+) {
     // The read below is the pause between looks and the detector of a closed peer.
     if out
         .set_read_timeout(Some(Duration::from_millis(5)))
@@ -1269,8 +1956,30 @@ fn serve(stream: UnixStream, id: u64, state: &Mutex<State>, stop: &AtomicBool, s
         return;
     };
     let mut authenticated = false;
-    for line in BufReader::new(stream).lines() {
-        let Ok(line) = line else { break };
+    // Once `stream` is answered `OK`, every later line is a record.
+    let mut streaming = false;
+    let mut reader = BufReader::new(stream);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // A last line without its newline is not a whole line.
+        if bytes.pop() != Some(b'\n') {
+            break;
+        }
+        if streaming {
+            lock(state).stream_line(id, &bytes);
+            continue;
+        }
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        let Ok(line) = std::str::from_utf8(&bytes) else {
+            break;
+        };
         if !authenticated {
             // `AUTH <token>` has no reply of its own; the next request's reply is
             // the first line a client reads.
@@ -1292,11 +2001,21 @@ fn serve(stream: UnixStream, id: u64, state: &Mutex<State>, stop: &AtomicBool, s
                 let _ = out.write_all(format!("{reply}\n").as_bytes());
                 break;
             }
-            lock(state).subscriptions += 1;
+            // Where the subscription starts is read before its ACK: an event pushed once the
+            // client has read the ACK is the subscription's.
+            let start = {
+                let mut state = lock(state);
+                state.subscriptions += 1;
+                (state.events.len(), state.events_ended)
+            };
             if out.write_all(subscribe_ack(sid).as_bytes()).is_ok() {
-                stream_events(out, state, stop);
+                stream_events(out, state, stop, start);
             }
             break;
+        }
+        if line == "stream" || line.starts_with("stream ") {
+            streaming = lock(state).open_stream(id, line, sid, &mut out);
+            continue;
         }
         let reply = if line == "version" {
             "OK version=fake-aterm".to_string()
@@ -1315,14 +2034,25 @@ fn serve(stream: UnixStream, id: u64, state: &Mutex<State>, stop: &AtomicBool, s
             break;
         }
     }
-    // The connection is gone, and a claim bound to it goes with it.
+    // The connection is gone, and a claim bound to it goes with it, as does a
+    // stream it carried.
     let mut state = lock(state);
     if state
-        .claim
+        .streams
+        .open
         .as_ref()
-        .is_some_and(|claim| claim.connection == id)
+        .is_some_and(|(open, _, _)| *open == id)
     {
-        state.release();
+        state.streams.close();
+    }
+    let graced = state.streams.grace;
+    if let Some(claim) = state.claim.as_mut().filter(|claim| claim.connection == id) {
+        if graced && claim.words.contract.as_deref() == Some("4") {
+            // Kept, unbound, through the re-exec grace (D28).
+            claim.connection = 0;
+        } else {
+            state.release();
+        }
     }
 }
 

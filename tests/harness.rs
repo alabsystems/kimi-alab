@@ -62,6 +62,7 @@ ev="$rec/$label.events"
 { printf '%s' "$label"; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$rec/argv"
 run=$(($(wc -l < "$rec/argv")))
 echo "auto_update=${KIMI_CODE_NO_AUTO_UPDATE-unset} shim=${FAKE_SHIM-unset}" > "$rec/$label.env"
+echo "no_harness=${ATERM_NO_HARNESS-unset}" > "$rec/$label.left-out"
 printf 'home=%s model=%s key=%s headers=%s\n' "${KIMI_CODE_HOME-default}" "${KIMI_MODEL_NAME+set}" "${KIMI_MODEL_API_KEY+set}" "${KIMI_CODE_CUSTOM_HEADERS+set}" >> "$rec/$label.account"
 ulimit -c 0
 case "${FAKE_MODE:-session}" in
@@ -626,6 +627,249 @@ fn atpkg_run_envelope_passes_vendor_arguments_verbatim() {
     assert_eq!(lab.argv(), "A [--version] [a b] [] [--alab-which]\n");
 }
 
+/// A stand-in `aterm` on `PATH`: it records how it was run (its pid, the self-update re-entry
+/// guard it was handed, and its words) in `$FAKE_REC/aterm.calls`, then, under `FAKE_FORWARD`,
+/// does what atpkg's `__selfupdate` does with a shape it forwards to the vendor: it runs the
+/// launcher again by `exec`, under the same pid, with the words after `--`. Otherwise it exits 7.
+const FAKE_ATERM: &str = r#"#!/bin/sh
+{ printf 'pid=%s guard=%s' "$$" "${__ATPKG_SELFUPDATE_PID-unset}"; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$FAKE_REC/aterm.calls"
+if [ -n "$FAKE_FORWARD" ]; then
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
+  shift
+  exec "$HARNESS_BIN" run -- "$@"
+fi
+exit 7
+"#;
+
+impl Lab {
+    /// Lay [`FAKE_ATERM`] as `aterm` in a directory of its own, and return the `PATH` that puts
+    /// it ahead of the system's.
+    fn lay_aterm(&self) -> String {
+        let bin = self.root.join("aterm-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let aterm = bin.join("aterm");
+        std::fs::write(&aterm, FAKE_ATERM).unwrap();
+        std::fs::set_permissions(&aterm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("{}:/usr/bin:/bin", bin.display())
+    }
+
+    /// What the stand-in `aterm` recorded, one line per run.
+    fn aterm_calls(&self) -> String {
+        std::fs::read_to_string(self.rec().join("aterm.calls")).unwrap_or_default()
+    }
+
+    /// Run the harness with `args` to its end, with no terminal and Kimi exiting at once:
+    /// its status, its standard error, and the vendor runs it made (`argv`, emptied first).
+    fn launch(&mut self, args: &[&str], fake: &[(&str, &str)]) -> (ExitStatus, String, String) {
+        let _ = std::fs::remove_file(self.rec().join("argv"));
+        let fake: Vec<(&str, &str)> = [("FAKE_MODE", "exit")]
+            .into_iter()
+            .chain(fake.iter().copied())
+            .collect();
+        let mut child = self.spawn(args, &fake);
+        let status = wait_exit(&mut child, DEADLINE);
+        let stderr = stderr_of(&mut child);
+        (status, stderr, self.argv())
+    }
+}
+
+/// The launcher's yolo block, carried into `run` (atpkg `yolo.rs` `decide`, printed as its
+/// `sh` block prints it): a launch through `run --` that names no approval posture gets Kimi's
+/// `--auto` in front, a typed `--yolo` becomes `--auto` (dropping Kimi's weaker `-y` ahead of
+/// the first word), and either prints the command as run on standard error, byte for byte as
+/// atpkg's launcher does. A launch that names its own posture or a management word runs as
+/// typed; so does one outside the envelope, which is pure pass-through. `--no-harness` is taken
+/// off and Kimi runs in the harness's place with no default, and `ATERM_NO_HARNESS=1` gets none
+/// either.
+#[test]
+fn run_sets_the_yolo_default() {
+    let mut lab = Lab::new("yolo-default");
+    lab.lay(BUILD_A, "A", "2.3.1");
+    lab.make_current(BUILD_A);
+    for (args, ran, said) in [
+        (
+            &["run", "--"][..],
+            "A [--auto]\n",
+            "aterm: yolo (default): running 'kimi' '--auto'\n",
+        ),
+        (
+            &["run", "--", "-m", "k2", "it's"],
+            "A [--auto] [-m] [k2] [it's]\n",
+            "aterm: yolo (default): running 'kimi' '--auto' '-m' 'k2' 'it'\\''s'\n",
+        ),
+        (
+            &["run", "--", "-y", "--yolo", "-m", "k2"],
+            "A [--auto] [-m] [k2]\n",
+            "aterm: --yolo: running 'kimi' '--auto' '-m' 'k2'\n",
+        ),
+        (&["run", "--", "--plan"], "A [--plan]\n", ""),
+        (&["run", "--", "--session=abc"], "A [--session=abc]\n", ""),
+        (&["run", "--", "login"], "A [login]\n", ""),
+        (&["run", "--", "--unknown"], "A [--unknown]\n", ""),
+        (&["hello"], "A [hello]\n", ""),
+        (&["run", "--", "--no-harness", "hello"], "A [hello]\n", ""),
+    ] {
+        let (status, stderr, argv) = lab.launch(args, &[]);
+        assert!(status.success(), "{args:?}: {stderr}");
+        assert_eq!(argv, ran, "{args:?}");
+        assert_eq!(stderr, said, "{args:?}");
+    }
+    let left_out = std::fs::read_to_string(lab.rec().join("A.left-out")).unwrap();
+    assert_eq!(
+        left_out.trim(),
+        "no_harness=1",
+        "--no-harness reaches Kimi as the variable"
+    );
+    assert!(
+        lab.journal()
+            .contains("--no-harness leaves the harness out"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    let (status, stderr, argv) = lab.launch(&["run", "--", "hello"], &[("ATERM_NO_HARNESS", "1")]);
+    assert!(status.success(), "{stderr}");
+    assert_eq!((argv.as_str(), stderr.as_str()), ("A [hello]\n", ""));
+}
+
+/// The launcher's sign-in gate, carried into `run`: Kimi has none. Its atpkg row says
+/// `signin_gate: None` (aterm `vendor_direct/table.rs`) and `aterm harness signin` serves
+/// `--cli grok` alone, so atpkg's launcher runs a signed-out interactive Kimi launch inside aterm
+/// as it is, and so does `run`: Kimi starts, with the yolo default, and aterm is never asked to
+/// sign anyone in. NEGATIVE CONTROL: the same `aterm` on `PATH` is run for `run -- update`, so a
+/// gate that called it would have been seen.
+#[test]
+fn run_gates_a_signed_out_launch() {
+    let mut lab = Lab::new("signin");
+    lab.lay(BUILD_A, "A", "2.3.1");
+    lab.make_current(BUILD_A);
+    let path = lab.lay_aterm();
+    let kimi_home = lab.root.join("kimi-home");
+    assert_eq!(
+        std::fs::read_dir(&kimi_home).unwrap().count(),
+        0,
+        "signed out: Kimi's home holds no login"
+    );
+    let inside = [("PATH", path.as_str()), ("ATERM_CHILD", "1")];
+    let (status, stderr, argv) = lab.launch(&["run", "--"], &inside);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(argv, "A [--auto]\n");
+    assert_eq!(
+        lab.aterm_calls(),
+        "",
+        "the launch asked aterm for a sign-in"
+    );
+    let (status, _, argv) = lab.launch(&["run", "--", "update"], &inside);
+    assert_eq!(status.code(), Some(7), "the control: aterm on PATH is run");
+    assert_eq!(argv, "");
+    assert_eq!(
+        lab.aterm_calls().lines().count(),
+        1,
+        "{}",
+        lab.aterm_calls()
+    );
+}
+
+/// The launcher's self-update intercept, carried into `run`: `kimi update` and `kimi upgrade`
+/// through `run --` replace the harness with `aterm pkg __selfupdate kimi <prefix> -- <words>`
+/// (atpkg's hidden verb, which runs `aterm pkg update kimi`) under the re-entry guard
+/// `__ATPKG_SELFUPDATE_PID` set to the harness's own pid, and Kimi never starts. A forward that
+/// comes back under that pid (atpkg runs Kimi's own `update --help` by `exec`) runs Kimi with
+/// the words and no yolo default. A self-update word that is not the first, or outside the
+/// envelope, is Kimi's.
+#[test]
+fn run_intercepts_self_update() {
+    let mut lab = Lab::new("self-update");
+    lab.lay(BUILD_A, "A", "2.3.1");
+    lab.make_current(BUILD_A);
+    let path = lab.lay_aterm();
+    let prefix = lab.prefix().display().to_string();
+    let on_path = [("PATH", path.as_str()), ("HARNESS_BIN", HARNESS)];
+    for word in ["update", "upgrade"] {
+        let _ = std::fs::remove_file(lab.rec().join("aterm.calls"));
+        let mut child = lab.spawn(&["run", "--", word], &on_path);
+        let harness = child.id();
+        let status = wait_exit(&mut child, DEADLINE);
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the harness was replaced by aterm: {}",
+            stderr_of(&mut child)
+        );
+        assert_eq!(
+            lab.aterm_calls(),
+            format!(
+                "pid={harness} guard={harness} [pkg] [__selfupdate] [kimi] [{prefix}] [--] [{word}]\n"
+            )
+        );
+        assert_eq!(lab.argv(), "", "Kimi ran for `{word}`");
+    }
+    let _ = std::fs::remove_file(lab.rec().join("aterm.calls"));
+    let forward: Vec<(&str, &str)> = on_path
+        .iter()
+        .copied()
+        .chain([("FAKE_FORWARD", "1")])
+        .collect();
+    let (status, stderr, argv) = lab.launch(&["run", "--", "update", "--help"], &forward);
+    assert!(status.success(), "{stderr}");
+    assert_eq!(argv, "A [update] [--help]\n");
+    assert_eq!(stderr, "", "no yolo default on a forwarded update");
+    assert_eq!(
+        lab.aterm_calls().lines().count(),
+        1,
+        "{}",
+        lab.aterm_calls()
+    );
+    let _ = std::fs::remove_file(lab.rec().join("aterm.calls"));
+    for (args, ran) in [
+        (
+            &["run", "--", "-m", "k2", "update"][..],
+            "A [-m] [k2] [update]\n",
+        ),
+        (&["update"], "A [update]\n"),
+        (&["run", "--", "Update"], "A [--auto] [Update]\n"),
+    ] {
+        let (status, stderr, argv) = lab.launch(args, &on_path);
+        assert!(status.success(), "{args:?}: {stderr}");
+        assert_eq!(argv, ran, "{args:?}");
+    }
+    assert_eq!(
+        lab.aterm_calls(),
+        "",
+        "aterm ran for a launch that is Kimi's"
+    );
+}
+
+/// The shim's environment, carried into `run`: atpkg's launcher exports it only after its
+/// hand-off to the harness, so a harness-led Kimi gets it from the harness: the build's
+/// `<build>.shim-env` (the entries atpkg's shim for that build exports: here
+/// `KIMI_CODE_NO_AUTO_UPDATE=1` and one of the test's own) over whatever the launch's own
+/// environment said, and with no sidecar the row's own `KIMI_CODE_NO_AUTO_UPDATE=1`, whether the
+/// harness supervises Kimi or runs it in its place.
+#[test]
+fn run_sets_the_shim_env() {
+    let mut lab = Lab::new("shim-env");
+    lab.lay(BUILD_A, "A", "2.3.1");
+    lab.make_current(BUILD_A);
+    let env = |lab: &Lab| {
+        std::fs::read_to_string(lab.rec().join("A.env"))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    let launch_env = [("KIMI_CODE_NO_AUTO_UPDATE", "0"), ("FAKE_SHIM", "off")];
+    for args in [&["run", "--"][..], &["run", "--", "--no-harness"]] {
+        let (status, stderr, _) = lab.launch(args, &launch_env);
+        assert!(status.success(), "{args:?}: {stderr}");
+        assert_eq!(env(&lab), "auto_update=1 shim=on", "{args:?}");
+    }
+    std::fs::remove_file(lab.prefix().join(format!("store/kimi/{BUILD_A}.shim-env"))).unwrap();
+    for args in [&["run", "--"][..], &["run", "--", "--no-harness"]] {
+        let (status, stderr, _) = lab.launch(args, &[]);
+        assert!(status.success(), "{args:?}: {stderr}");
+        assert_eq!(env(&lab), "auto_update=1 shim=unset", "{args:?}");
+    }
+}
+
 #[test]
 fn dies_by_the_signal_that_killed_the_child() {
     let mut lab = Lab::new("signal-death");
@@ -856,32 +1100,216 @@ fn aterm_attests_and_reclaims_an_automatic_move() {
     assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
-/// Against an aterm from before contract 4, the claim is contract 3's, made only after the
-/// roster guard finds the harness's row.
+/// No request the harness sent names contract 3: no claim at 3, and no contract-3 roster read.
+fn assert_never_contract_3(aterm: &FakeAterm) {
+    let verbs = aterm.verbs();
+    assert!(
+        !verbs
+            .iter()
+            .any(|verb| verb.contains(" contract=3") || verb == "native-act info"),
+        "{verbs:?}"
+    );
+}
+
+/// Against an aterm from before contract 4 (it serves 2 and 3), no claim is made at all: this
+/// build declares contract 4 alone (`alab-harness.toml`, `contracts = [4]`) to alab-wire, whose
+/// claim sequence reads the policy and sends nothing more, and Kimi runs in the harness's
+/// place. Not even the contract-3 roster guard is asked.
 #[test]
-fn against_an_aterm_without_contract_4_the_claim_is_contract_3s() {
+fn against_an_aterm_without_contract_4_no_claim_is_made_and_kimi_runs_in_place() {
     let mut lab = Lab::new("aterm-three");
     let aterm = fake_aterm("aterm-three");
     aterm.serve_contracts(&[2, 3]);
     let env = aterm.env();
     let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert_eq!(lab.pid_of("A"), Some(Pid::from_child(&child)));
     assert!(
-        wait_for(DEADLINE, || claims(&aterm).len() == 2),
-        "aterm never proved the claim; journal:\n{}",
+        lab.journal()
+            .contains("UNCLAIMED policy contract=2,3 declared=4")
+            && lab.journal().contains(
+                " PASS the vendor runs in the harness's place: policy contract=2,3 declared=4"
+            ),
+        "journal:\n{}",
         lab.journal()
     );
-    let verbs = aterm.verbs();
-    let roster = verbs.iter().position(|verb| verb == "native-act info");
-    let claimed = verbs
-        .iter()
-        .position(|verb| verb.starts_with("meta set supervisor "));
-    assert!(roster.is_some() && roster < claimed, "{verbs:?}");
-    for claim in claims(&aterm) {
-        assert!(
-            claim.contains(" contract=3 scope=relaunch,upgrade ") && !claim.contains(" child="),
-            "{claim}"
-        );
-    }
+    assert!(claims(&aterm).is_empty(), "{:?}", aterm.verbs());
+    assert_never_contract_3(&aterm);
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// A claim alab-wire makes again on its own clock keeps to contract 4 too: an aterm that
+/// answered `ERR` at launch and then serves only 2 and 3 is sent no claim at all while Kimi runs
+/// on unclaimed, and once it serves 4 again the claim is made at 4, naming the child that runs.
+/// No request ever names contract 3.
+/// NEGATIVE CONTROL: the claim at 4 once aterm serves it shows the link was claiming all along.
+#[test]
+fn a_claim_made_again_never_names_contract_3_and_is_made_at_4_once_served() {
+    let mut lab = Lab::new("reclaim-three");
+    let aterm = fake_aterm("reclaim-three");
+    aterm.set_policy_reply(DIALOG_ERR);
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert_ne!(lab.pid_of("A"), Some(Pid::from_child(&child)));
+    aterm.serve_contracts(&[2, 3]);
+    aterm.clear_policy_reply();
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("UNCLAIMED policy contract=2,3 declared=4")),
+        "journal:\n{}",
+        lab.journal()
+    );
+    assert!(claims(&aterm).is_empty(), "{:?}", aterm.verbs());
+    assert_eq!(aterm.holder(), None);
+    assert!(lab.pid_of("A").is_some());
+    aterm.serve_contracts(&[2, 3, 4]);
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains(" contract=4 scope=relaunch,upgrade ")),
+        "the claim was not made at 4 once aterm served it; journal:\n{}",
+        lab.journal()
+    );
+    let claims = claims(&aterm);
+    let a = lab.pid_of("A").unwrap().as_raw_nonzero();
+    assert_eq!(claims.len(), 1, "{claims:?}");
+    assert!(
+        claims[0].contains(" contract=4 ") && claims[0].contains(&format!(" child={a}:")),
+        "{claims:?}"
+    );
+    assert_never_contract_3(&aterm);
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// An aterm that restarts into one serving only 2 and 3 ends the claim at 4, and the claim made
+/// again on the link's clock is never sent at 3. Its last word is that it serves no contract
+/// this build declares, so a crash then is passed on at once, as with no claim, rather than
+/// waiting out the 45 s budget for a claim that cannot come.
+#[test]
+fn a_crash_after_aterm_drops_contract_4_is_passed_on_at_once_and_3_is_never_claimed() {
+    let mut lab = Lab::new("drop-four");
+    let aterm = fake_aterm("drop-four");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
+    );
+    assert!(
+        wait_for(DEADLINE, || claims(&aterm).len() == 2),
+        "aterm never proved the claim and its child; journal:\n{}",
+        lab.journal()
+    );
+    aterm.restart();
+    aterm.serve_contracts(&[2, 3]);
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("UNCLAIMED policy contract=2,3 declared=4")),
+        "journal:\n{}",
+        lab.journal()
+    );
+    lab.let_run_crash(1);
+    let status = wait_exit(&mut child, DEADLINE);
+    assert_eq!(status.signal(), Some(9), "status: {status:?}");
+    assert!(
+        lab.journal()
+            .contains("CRASH-PASSED-ON no-claim policy contract=2,3 declared=4")
+            && !lab.journal().contains("CRASH-WAIT"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(lab.argv(), "A\n");
+    assert_eq!(claims(&aterm).len(), 2, "{:?}", aterm.verbs());
+    assert_never_contract_3(&aterm);
+}
+
+/// A crash that begins while the link is lost to an aterm restarting into one that serves only
+/// 2 and 3, before the claim made again has heard that answer, waits for aterm. Once the answer
+/// is read, on the link's 5 s clock, the crash is passed on as with no claim, rather than
+/// waiting out the 45 s budget for a claim that cannot come and being passed on as
+/// `claim-not-proven-again`: the harness exits within `DEADLINE`, well inside that budget.
+/// NEGATIVE CONTROL: `CRASH-WAIT` journalled before `UNCLAIMED` shows the crash began before
+/// aterm's answer, so it was not the check at the crash that passed it on.
+#[test]
+fn a_crash_waiting_for_aterm_is_passed_on_once_aterm_answers_it_serves_no_4() {
+    let mut lab = Lab::new("wait-four");
+    let aterm = fake_aterm("wait-four");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
+    );
+    assert!(
+        wait_for(DEADLINE, || claims(&aterm).len() == 2),
+        "aterm never proved the claim and its child; journal:\n{}",
+        lab.journal()
+    );
+    aterm.restart();
+    aterm.serve_contracts(&[2, 3]);
+    lab.let_run_crash(1);
+    let status = wait_exit(&mut child, DEADLINE);
+    assert_eq!(status.signal(), Some(9), "status: {status:?}");
+    let journal = lab.journal();
+    let waited = journal.find(" CRASH-WAIT ");
+    let answered = journal.find(" UNCLAIMED policy contract=2,3 declared=4");
+    assert!(
+        matches!((waited, answered), (Some(w), Some(a)) if w < a),
+        "the crash did not wait for aterm's answer; journal:\n{journal}"
+    );
+    assert!(
+        journal.contains("CRASH-PASSED-ON no-claim policy contract=2,3 declared=4")
+            && !journal.contains("claim-not-proven-again"),
+        "journal:\n{journal}"
+    );
+    assert_eq!(lab.argv(), "A\n");
+    assert_eq!(claims(&aterm).len(), 2, "{:?}", aterm.verbs());
+    assert_never_contract_3(&aterm);
+}
+
+/// A restart aterm asked for that waits for aterm (its policy reads answer `ERR`) is refused
+/// once aterm, restarted into one that serves only 2 and 3, answers the claim made again so: no
+/// claim stands and none can, so it is not left to wait out the restart wait (45 s by default,
+/// longer than `DEADLINE`) and is never made later.
+#[test]
+fn a_restart_waiting_for_aterm_is_refused_once_aterm_answers_it_serves_no_4() {
+    let mut lab = Lab::new("rs-four");
+    let aterm = fake_aterm("rs-four");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.set_policy_reply(DIALOG_ERR);
+    aterm.send_restart("asked");
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("RESTART-WAITS cause=asked aterm did not answer")),
+        "the restart did not wait for aterm; journal:\n{}",
+        lab.journal()
+    );
+    aterm.restart();
+    aterm.serve_contracts(&[2, 3]);
+    aterm.clear_policy_reply();
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains(
+            "RESTART-REFUSED cause=asked no-claim policy contract=2,3 declared=4"
+        )),
+        "the restart was not refused on aterm's answer; journal:\n{}",
+        lab.journal()
+    );
+    // An absence: the refused restart is never made later. A restart that waits is asked about
+    // again a second after the pass that refused it; that and a whole pass go by, and the
+    // harness's decision, a `RESTART` line, is looked for.
+    lab.pass_after(
+        &mut child,
+        Duration::from_millis(alab_wire::link::LATER_RETRY_MS),
+    );
+    assert_eq!(lab.notes("RESTART"), 0, "journal:\n{}", lab.journal());
+    assert_eq!(lab.pid_of("A"), Some(first));
+    assert_eq!(lab.argv(), "A\n");
+    assert_never_contract_3(&aterm);
     signal(&child, Signal::TERM);
     assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
@@ -1644,40 +2072,8 @@ fn attest_under_cap(name: &str, cap: Scope) -> (String, bool) {
     (lab.journal(), moved)
 }
 
-/// Under contract 3, the roster guard: a harness off aterm's roster sends no claim, not even to
-/// find out, and Kimi runs in the harness's place.
-#[test]
-fn aterm_off_the_roster_is_never_claimed_and_kimi_runs_in_place() {
-    let mut lab = Lab::new("unrostered");
-    let aterm = fake_aterm("unrostered");
-    aterm.serve_contracts(&[2, 3]);
-    aterm.set_row("kimi-alab", &[]);
-    aterm.set_row("grok-alab", &Scope::CONTRACT_3);
-    let env = aterm.env();
-    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
-    // The harness execs the vendor in its own place.
-    assert_eq!(lab.pid_of("A"), Some(Pid::from_child(&child)));
-    assert!(
-        lab.journal().contains("PASS") && lab.journal().contains("unrostered"),
-        "journal:\n{}",
-        lab.journal()
-    );
-    assert!(
-        aterm.verbs().iter().any(|verb| verb == "native-act info"),
-        "{:?}",
-        aterm.verbs()
-    );
-    assert!(
-        claims(&aterm).is_empty(),
-        "a claim was sent off the roster: {:?}",
-        aterm.verbs()
-    );
-    signal(&child, Signal::TERM);
-    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
-}
-
 /// Under contract 4 aterm may grant less than the claim asked for. A launch granted less than
-/// both duties gives the claim back and Kimi runs in the harness's place, as under contract 3.
+/// both duties gives the claim back and Kimi runs in the harness's place.
 #[test]
 fn a_claim_granted_less_than_both_duties_is_released_and_kimi_runs_in_place() {
     let mut lab = Lab::new("scope");
@@ -1701,36 +2097,6 @@ fn a_claim_granted_less_than_both_duties_is_released_and_kimi_runs_in_place() {
         aterm.verbs()
     );
     assert_eq!(aterm.holder(), None);
-    signal(&child, Signal::TERM);
-    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
-}
-
-/// Under contract 3 the scope is read back from `status`: a claim aterm stored with less than
-/// both duties (here a person's cap that lands between the claim and its read) is given back,
-/// and Kimi runs in the harness's place.
-#[test]
-fn a_contract_3_claim_read_back_with_less_than_both_duties_is_released() {
-    let mut lab = Lab::new("scope-three");
-    let aterm = fake_aterm("scope-three");
-    aterm.serve_contracts(&[2, 3]);
-    aterm.set_cap_after_next_claim(Some(&[Scope::Upgrade]));
-    let env = aterm.env();
-    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
-    assert_eq!(lab.pid_of("A"), Some(Pid::from_child(&child)));
-    assert!(
-        lab.journal()
-            .contains("unproven scope=relaunch supervisor_scope=upgrade"),
-        "journal:\n{}",
-        lab.journal()
-    );
-    assert!(
-        aterm
-            .verbs()
-            .iter()
-            .any(|verb| verb.starts_with("meta unset supervisor holder=kimi-alab@")),
-        "the claim was not given back: {:?}",
-        aterm.verbs()
-    );
     signal(&child, Signal::TERM);
     assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }

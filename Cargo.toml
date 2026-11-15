@@ -7,7 +7,7 @@ exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0 OR MIT"
@@ -40,8 +40,10 @@ name = "test"
 stage = "source"
 run = ["targo", "--unverified", "test", "--locked", "--workspace"]
 within-secs = 3600
-# 126 on 2026-11-14 (72 unit, 53 in tests/harness.rs, 1 in tests/pin.rs); 118 when the aterm
-# client moved to alab-wire, whose unit tests went with it (README decision 33).
+# 140 on 2026-11-14 with alab-wire v0.7.0's declared contracts (80 unit, 59 in tests/harness.rs,
+# 1 in tests/pin.rs; README decision 41); 136 with the launcher's blocks in `run` (decision 38);
+# 126 before them; 118 when the aterm client moved to alab-wire, whose unit tests went with it
+# (README decision 33).
 min-tests = 115
 
 [[workspace.metadata.atpkg.qualify]]
@@ -125,7 +127,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The shared aterm client (alab-harness, crate alab-wire): the vendored copy of alab-harness
-# v0.1.0 under vendor/alab-harness, pinned by its git tree id in vendor/alab-harness.pin
+# v0.7.1 under vendor/alab-harness, pinned by its git tree id in vendor/alab-harness.pin
 # (alab-harness tools/pin; run it again with a newer tag and commit to move). tests/pin.rs
 # holds the committed copy to the pin.
 alab-wire = { path = "vendor/alab-harness/crates/alab-wire" }
@@ -135,7 +137,7 @@ signal-hook = { version = "0.4", default-features = false }
 serde_json = "1"
 
 [dev-dependencies]
-# The fake aterm the integration tests run the harness against, from the same vendored v0.1.0.
+# The fake aterm the integration tests run the harness against, from the same vendored v0.7.1.
 alab-wire = { path = "vendor/alab-harness/crates/alab-wire", features = ["fake"] }
 rustix = { version = "1", features = ["process", "pty", "fs"] }
 

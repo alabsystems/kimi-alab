@@ -18,10 +18,12 @@
 //!   a harness claims only after a read-only `native-act info` reply names its
 //!   row ([`rostered`]), under either contract.
 //! * **Claim at the highest contract both sides list.** `harness policy`'s
-//!   `contract=` is a set; the claim is made at the highest member this
-//!   library speaks ([`Contract::choose`]: 4, else 3), and only while the
-//!   policy reads `effective=on` ([`Policy`]). The claim is [`claim_verb`]'s
-//!   text for that contract.
+//!   `contract=` is a set; the claim is made at its highest member that the
+//!   harness declares ([`Config::contracts`]; [`Contract::choose`]: 4, else
+//!   3), and only while the policy reads `effective=on` ([`Policy`]). A
+//!   harness that declares `[4]` never claims 3. The claim is
+//!   [`claim_verb`]'s text for that contract, which is never made for a
+//!   contract the harness does not declare.
 //! * **Act only on the grant.** A contract-4 claim is answered
 //!   `OK scope=<granted> revision=<n>` ([`Grant::of_reply`]): aterm drops a
 //!   word it does not know, and a person's cap narrows the rest, so the grant
@@ -78,15 +80,17 @@ impl Contract {
         }
     }
 
-    /// The highest contract this library speaks that `served` (a policy's
-    /// `contract=` set) lists, or `None` when it lists none of them. A
-    /// harness claims at the highest number both sides list (the interface
-    /// design, section 2.2).
+    /// The highest of the `declared` contracts (the harness's own,
+    /// [`Config::contracts`]) that `served` (a policy's `contract=` set)
+    /// lists, or `None` when it lists none of them. A harness claims at the
+    /// highest number both sides list (the interface design, section 2.2),
+    /// and only at one it declares (the publication plan's D11: a harness
+    /// that declares `[4]` never claims 3).
     #[must_use]
-    pub fn choose(served: &[u32]) -> Option<Self> {
+    pub fn choose(declared: &[Self], served: &[u32]) -> Option<Self> {
         Self::SPOKEN
             .into_iter()
-            .find(|contract| served.contains(&contract.number()))
+            .find(|contract| declared.contains(contract) && served.contains(&contract.number()))
     }
 
     /// The scope words a claim under this contract names, of the `wanted`
@@ -109,11 +113,10 @@ impl Contract {
 
 /// The contract a claim would be made at when an `OK` policy reply advertises a
 /// contract set (`OK gen=… effective=… contract=2,3,4 …`): its highest member
-/// this library speaks ([`Contract::choose`]). An absent, malformed or
-/// duplicate field, or a set with no member this library speaks, returns
-/// `None`.
+/// of the `declared` ones ([`Contract::choose`]). An absent, malformed or
+/// duplicate field, or a set with no declared member, returns `None`.
 #[must_use]
-pub fn advertised_contract(policy_reply: &str) -> Option<Contract> {
+pub fn advertised_contract(policy_reply: &str, declared: &[Contract]) -> Option<Contract> {
     let mut words = policy_reply.split_ascii_whitespace();
     if words.next() != Some("OK") {
         return None;
@@ -127,7 +130,7 @@ pub fn advertised_contract(policy_reply: &str) -> Option<Contract> {
             advertised = Some(value);
         }
     }
-    Contract::choose(&contract_set(advertised?)?)
+    Contract::choose(declared, &contract_set(advertised?)?)
 }
 
 /// The longest `version=` a claim may carry (`contract.rs`, `VERSION_MAX`).
@@ -232,6 +235,20 @@ pub fn scope_words(scopes: &[Scope]) -> String {
         .join(",")
 }
 
+/// `contracts` spelled as a journal word: each number once, ascending,
+/// comma-joined (`3,4`).
+#[must_use]
+pub fn contract_words(contracts: &[Contract]) -> String {
+    let mut contracts = contracts.to_vec();
+    contracts.sort_unstable();
+    contracts.dedup();
+    contracts
+        .iter()
+        .map(|contract| contract.number().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The claim holder for harness `id`'s process `pid`: `<id>@<pid>`. aterm
 /// reads the pid back as canonical decimal above 1 and proves it against the
 /// kernel's peer pid (`contract.rs`, `holder_in`).
@@ -276,7 +293,7 @@ pub(crate) fn claim_version(text: &str) -> bool {
 
 /// `version` when aterm would read it as a claim's `vendor=`: 1 to 64 bytes of
 /// ASCII alphanumerics and `.`, `-`, `+`, `_` (`contract.rs`, `vendor_ok`).
-fn vendor_word(version: Option<&str>) -> Option<&str> {
+pub(crate) fn vendor_word(version: Option<&str>) -> Option<&str> {
     version.filter(|version| {
         !version.is_empty()
             && version.len() <= VENDOR_MAX
@@ -288,7 +305,7 @@ fn vendor_word(version: Option<&str>) -> Option<&str> {
 
 /// `label` when aterm would read it as a claim's `login=`: an account label,
 /// `[a-z0-9][a-z0-9._-]{0,63}` and not `help` (`accounts.rs`, `label_refusal`).
-fn login_word(label: Option<&str>) -> Option<&str> {
+pub(crate) fn login_word(label: Option<&str>) -> Option<&str> {
     let word = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     label.filter(|label| {
         let bytes = label.as_bytes();
@@ -359,14 +376,16 @@ fn addressed(sid: &str, verb: &str) -> Option<String> {
 /// under contract 4 only.
 ///
 /// `None`, and nothing may be sent, when `sid` is not a session ID, `pid` is
-/// not above 1, or the contract names none of `config`'s scope words (a
-/// contract-3 claim from a harness that claims only contract-4 duties).
-/// ([`Config`] has already refused an empty scope and a version aterm would
-/// not read.)
+/// not above 1, `contract` is not one `config` declares
+/// ([`Config::contracts`]), or the contract names none of `config`'s scope
+/// words (a contract-3 claim from a harness that claims only contract-4
+/// duties). ([`Config`] has already refused an empty scope and a version
+/// aterm would not read.)
 ///
 /// The text alone claims nothing, and sending it is permitted only after
-/// [`Policy::admits_claim`] holds, at the contract [`Policy::contract`]
-/// chose, and, at contract 3, [`rostered`] holds too.
+/// [`Policy::admits_claim`] holds for `config`'s contracts, at the contract
+/// [`Policy::contract`] chose of them, and, at contract 3, [`rostered`]
+/// holds too.
 #[must_use]
 pub fn claim_verb(
     config: &Config,
@@ -376,7 +395,7 @@ pub fn claim_verb(
     child: Child<'_>,
 ) -> Option<String> {
     let scopes = contract.scopes(config.scopes());
-    if pid <= 1 || scopes.is_empty() {
+    if pid <= 1 || scopes.is_empty() || !config.contracts().contains(&contract) {
         return None;
     }
     let mut verb = format!(
@@ -524,7 +543,7 @@ impl ReplyError {
     /// A reply that is not an `OK` line: [`ReplyError::Retry`] when its last
     /// word is `retry`, which is how aterm words a refusal that stands for now
     /// only, else [`ReplyError::Refused`].
-    fn refused(reply: &str) -> Self {
+    pub(crate) fn refused(reply: &str) -> Self {
         let words: Vec<String> = reply
             .split_ascii_whitespace()
             .take(2)
@@ -572,7 +591,8 @@ fn contract_set(value: &str) -> Option<Vec<u32>> {
         .collect()
 }
 
-fn canonical_u64(value: &str) -> Option<u64> {
+/// `value` as a canonical decimal: ASCII digits, no leading zero but `0` itself, within `u64`.
+pub(crate) fn canonical_u64(value: &str) -> Option<u64> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
         || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -675,26 +695,30 @@ impl Policy {
         })
     }
 
-    /// The contract a claim is made at: the highest one this library speaks
-    /// that the host serves ([`Contract::choose`]).
+    /// The contract a claim is made at: the highest of the `declared` ones
+    /// (the harness's, [`Config::contracts`]) that the host serves
+    /// ([`Contract::choose`]).
     #[must_use]
-    pub fn contract(&self) -> Option<Contract> {
-        Contract::choose(&self.contracts)
+    pub fn contract(&self, declared: &[Contract]) -> Option<Contract> {
+        Contract::choose(declared, &self.contracts)
     }
 
-    /// Whether the host serves a contract this library claims under.
+    /// Whether the host serves a contract this library speaks: the judges of
+    /// a claim that already stands ([`judge_safe_point`],
+    /// [`crate::relaunch::permitted`]) hold without one. Whether a harness
+    /// may claim is [`Policy::admits_claim`], for its own contracts.
     #[must_use]
     pub fn serves_contract(&self) -> bool {
-        self.contract().is_some()
+        self.contract(&Contract::SPOKEN).is_some()
     }
 
-    /// Whether this policy lets a rostered harness claim at all: contract 3 or
-    /// 4 is served and the policy is in effect for the session. It says
-    /// nothing about any one duty; [`judge_safe_point`] and
-    /// [`Policy::relaunch`] do.
+    /// Whether this policy lets a rostered harness that declares `declared`
+    /// claim at all: one of them is served and the policy is in effect for
+    /// the session. It says nothing about any one duty; [`judge_safe_point`]
+    /// and [`Policy::relaunch`] do.
     #[must_use]
-    pub fn admits_claim(&self) -> bool {
-        self.serves_contract() && self.effective
+    pub fn admits_claim(&self, declared: &[Contract]) -> bool {
+        self.contract(declared).is_some() && self.effective
     }
 
     /// Whether the policy is off for the session by configuration: aterm has
@@ -781,6 +805,10 @@ pub struct Status {
     pub composer: Option<String>,
     /// `human_ms=`.
     pub human: Human,
+    /// `human_seq=`: aterm's count of a person's keys and gestures in the session, which a
+    /// stream's `hand` record also carries ([`crate::stream::Hand`]). `None` when absent or not a
+    /// canonical decimal.
+    pub human_seq: Option<u64>,
     /// `hand=`: who drives the session (`-` for nobody).
     pub hand: Option<String>,
     /// `hold=`: `1` while a halt stands on the session.
@@ -831,11 +859,27 @@ impl Status {
                     .map_or(Human::Unknown, |ms| Human::Ago(Duration::from_millis(ms))),
                 None => Human::Unknown,
             },
+            human_seq: fields.get("human_seq").and_then(canonical_u64),
             hand: word("hand"),
             hold: word("hold"),
             input: word("input"),
             need: word("need"),
         })
+    }
+
+    /// Fill the fields a stream's `hand` record carries: `human_seq`, `composer` (`empty` or
+    /// `draft`) and `hold` (`1` while a halt stands). aterm sends `hand` when one of them
+    /// changes, at most every 100 ms and always the latest, so a harness knows a person typed,
+    /// or a halt, without reading `status` again. A record whose `human_seq` is below this
+    /// status's is older than the read and fills nothing. Whether it filled.
+    pub(crate) fn hand(&mut self, human_seq: u64, composer: &str, hold: bool) -> bool {
+        if self.human_seq.is_some_and(|read| human_seq < read) {
+            return false;
+        }
+        self.human_seq = Some(human_seq);
+        self.composer = Some(composer.to_string());
+        self.hold = Some(if hold { "1" } else { "0" }.to_string());
+        true
     }
 
     /// Whether this status shows `holder`'s claim standing and proven.
@@ -1015,6 +1059,20 @@ pub fn model_word(model: &str) -> bool {
         })
 }
 
+/// Whether `cause` is a restart's cause: 1 to 64 ASCII alphanumerics, `-` and `_`.
+pub(crate) fn restart_cause(cause: &str) -> bool {
+    (1..=JOURNAL_WORD_MAX).contains(&cause.len())
+        && cause
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Whether a restart for `cause` may name an account to move to (`to=` and `home=`): `account`
+/// and `account-ahead`, the account pool's causes.
+pub(crate) fn account_cause(cause: &str) -> bool {
+    matches!(cause, "account" | "account-ahead")
+}
+
 impl Restart {
     /// Read the words after `restart` in an event line. The first must be
     /// `cause=<word>`, a word of 1 to 64 ASCII alphanumerics, `-` and `_`, and no
@@ -1027,12 +1085,7 @@ impl Restart {
     #[must_use]
     pub fn parse<'a>(mut words: impl Iterator<Item = &'a str>) -> Option<Self> {
         let cause = words.next()?.strip_prefix("cause=")?;
-        if cause.is_empty()
-            || cause.len() > JOURNAL_WORD_MAX
-            || !cause
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !restart_cause(cause) {
             return None;
         }
         let (mut label, mut home, mut model) = (None, None, None);
@@ -1050,7 +1103,7 @@ impl Restart {
         }
         let account = match (label, home) {
             (None, None) => None,
-            (Some(label), Some(home)) if matches!(cause, "account" | "account-ahead") => {
+            (Some(label), Some(home)) if account_cause(cause) => {
                 let label = login_word(Some(label))?.to_string();
                 let home = if home == "-" {
                     None
@@ -1393,12 +1446,15 @@ mod tests {
     #[test]
     fn an_older_policy_without_contracts_admits_no_claim() {
         let older = "OK gen=12 effective=on why=config continue=on land=off questions=on";
-        assert_eq!(advertised_contract(older), None);
+        assert_eq!(advertised_contract(older, &BOTH), None);
     }
 
+    /// The contracts a harness declares unless it says otherwise.
+    const BOTH: [Contract; 2] = Config::DEFAULT_CONTRACTS;
+
     /// A harness claims at the highest number both sides list: 4 wherever it
-    /// is listed, 3 against an aterm from before contract 4, and nothing
-    /// against one that lists neither.
+    /// is listed, 3 against an aterm from before contract 4 to a harness that
+    /// declares it, and nothing against one that lists neither.
     #[test]
     fn the_claim_is_made_at_the_highest_contract_both_sides_list() {
         for reply in [
@@ -1407,7 +1463,12 @@ mod tests {
             "OK contract=3,2",
             "OK contract=2,3,5",
         ] {
-            assert_eq!(advertised_contract(reply), Some(Contract::Three), "{reply}");
+            assert_eq!(
+                advertised_contract(reply, &BOTH),
+                Some(Contract::Three),
+                "{reply}"
+            );
+            assert_eq!(advertised_contract(reply, &[Contract::Four]), None);
         }
         for reply in [
             "OK contract=2,3,4",
@@ -1415,12 +1476,36 @@ mod tests {
             "OK contract=4,3",
             "OK contract=3,4,5",
         ] {
-            assert_eq!(advertised_contract(reply), Some(Contract::Four), "{reply}");
+            assert_eq!(
+                advertised_contract(reply, &BOTH),
+                Some(Contract::Four),
+                "{reply}"
+            );
+            assert_eq!(
+                advertised_contract(reply, &[Contract::Four]),
+                Some(Contract::Four)
+            );
         }
-        assert_eq!(Contract::choose(&[2, 3, 4]), Some(Contract::Four));
-        assert_eq!(Contract::choose(&[3]), Some(Contract::Three));
-        assert_eq!(Contract::choose(&[2, 5]), None);
-        assert_eq!(Contract::choose(&[]), None);
+        assert_eq!(Contract::choose(&BOTH, &[2, 3, 4]), Some(Contract::Four));
+        assert_eq!(Contract::choose(&BOTH, &[3]), Some(Contract::Three));
+        assert_eq!(Contract::choose(&BOTH, &[2, 5]), None);
+        assert_eq!(Contract::choose(&BOTH, &[]), None);
+        // Only a declared contract is chosen, however high the host goes.
+        assert_eq!(Contract::choose(&[Contract::Four], &[2, 3]), None);
+        assert_eq!(
+            Contract::choose(&[Contract::Four], &[3, 4]),
+            Some(Contract::Four)
+        );
+        assert_eq!(
+            Contract::choose(&[Contract::Three], &[2, 3, 4]),
+            Some(Contract::Three)
+        );
+        assert_eq!(Contract::choose(&[], &[2, 3, 4]), None);
+        assert_eq!(
+            contract_words(&[Contract::Four, Contract::Three, Contract::Four]),
+            "3,4"
+        );
+        assert_eq!(contract_words(&[Contract::Four]), "4");
         assert_eq!(
             Contract::SPOKEN.map(Contract::number),
             [4, 3],
@@ -1444,13 +1529,13 @@ mod tests {
             "OK contract=3,4294967296",
             "OK contract=3 contract=2,3",
         ] {
-            assert_eq!(advertised_contract(reply), None, "{reply:?}");
+            assert_eq!(advertised_contract(reply, &BOTH), None, "{reply:?}");
         }
     }
 
     #[test]
     fn recognizing_a_host_contract_alone_admits_no_claim() {
-        assert!(advertised_contract("OK contract=2,3").is_some());
+        assert!(advertised_contract("OK contract=2,3", &BOTH).is_some());
         // The contract set is one of seven facts a policy must state, and the
         // policy one of three gates (with the roster and the proof read-back).
         assert_eq!(
@@ -1526,7 +1611,10 @@ mod tests {
                 human_grace: Duration::from_secs(120),
             }
         );
-        assert!(policy.serves_contract() && policy.admits_claim());
+        assert!(policy.serves_contract() && policy.admits_claim(&BOTH));
+        // The live aterm lists `2,3`: a harness that declares `[4]` claims nothing there.
+        assert!(!policy.admits_claim(&[Contract::Four]));
+        assert_eq!(policy.contract(&[Contract::Four]), None);
         let more = format!("{LIVE_POLICY} bare-word a_new_key=1 =x");
         assert_eq!(Policy::parse(&more), Ok(policy));
     }
@@ -1553,7 +1641,7 @@ mod tests {
             let reply = with(&with(LIVE_POLICY, "effective", Some("off")), "why", why);
             let off = Policy::parse(&reply).unwrap();
             assert!(
-                !off.off_by_configuration() && !off.admits_claim(),
+                !off.off_by_configuration() && !off.admits_claim(&BOTH),
                 "{why:?}"
             );
         }
@@ -1579,9 +1667,9 @@ mod tests {
     #[test]
     fn a_policy_that_is_off_or_older_parses_but_admits_no_claim() {
         let off = Policy::parse(&with(LIVE_POLICY, "effective", Some("off"))).unwrap();
-        assert!(off.serves_contract() && !off.effective && !off.admits_claim());
+        assert!(off.serves_contract() && !off.effective && !off.admits_claim(&BOTH));
         let older = Policy::parse(&with(LIVE_POLICY, "contract", Some("2"))).unwrap();
-        assert!(!older.serves_contract() && older.effective && !older.admits_claim());
+        assert!(!older.serves_contract() && older.effective && !older.admits_claim(&BOTH));
     }
 
     #[test]
@@ -1644,6 +1732,7 @@ mod tests {
                 agent: Some("idle".to_string()),
                 composer: Some("empty".to_string()),
                 human: Human::Ago(Duration::from_millis(2_154_931)),
+                human_seq: Some(1474),
                 hand: Some("-".to_string()),
                 hold: Some("0".to_string()),
                 input: Some("clear".to_string()),
@@ -1662,6 +1751,32 @@ mod tests {
         assert!(Status::parse(&encoded).unwrap().held_by(ME));
     }
 
+    /// A stream's `hand` record fills what it carries, unless the status was read after it.
+    #[test]
+    fn a_hand_record_fills_the_hand_fields_of_a_status() {
+        let mut status = Status::parse(LIVE_STATUS).unwrap();
+        assert!(!status.hand(1473, "draft", true), "older than the read");
+        assert_eq!(status.human_seq, Some(1474));
+        assert_eq!(status.composer.as_deref(), Some("empty"));
+        assert!(status.hand(1474, "draft", true));
+        assert_eq!(status.composer.as_deref(), Some("draft"));
+        assert_eq!(status.hold.as_deref(), Some("1"));
+        assert!(status.hand(1480, "empty", false));
+        assert_eq!(
+            (
+                status.human_seq,
+                status.composer.as_deref(),
+                status.hold.as_deref()
+            ),
+            (Some(1480), Some("empty"), Some("0"))
+        );
+        // A status without `human_seq=` takes any hand.
+        let mut bare = Status::parse("OK schema=1 human_seq=x").unwrap();
+        assert_eq!(bare.human_seq, None);
+        assert!(bare.hand(3, "draft", false));
+        assert_eq!(bare.human_seq, Some(3));
+    }
+
     #[test]
     fn a_status_reply_states_no_claim_and_no_fact_it_does_not_carry() {
         let bare = Status::parse("OK schema=1").unwrap();
@@ -1675,6 +1790,7 @@ mod tests {
                 agent: None,
                 composer: None,
                 human: Human::Unknown,
+                human_seq: None,
                 hand: None,
                 hold: None,
                 input: None,
@@ -1857,6 +1973,13 @@ mod tests {
             assert_eq!(status_verb(sid), None);
             assert_eq!(info_verb(sid), None);
         }
+        // No claim text is made at a contract the harness does not declare.
+        let four = upgrade.with_contracts(&[Contract::Four]).expect("a config");
+        assert_eq!(
+            claim_verb(&four, Contract::Three, SID, 4242, Child::default()),
+            None
+        );
+        assert!(claim_verb(&four, Contract::Four, SID, 4242, Child::default()).is_some());
     }
 
     #[test]

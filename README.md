@@ -3,8 +3,9 @@
 The ALab harness for Moonshot AI's **Kimi Code** CLI (`kimi`).
 
 `kimi-alab` runs the **unmodified** vendor `kimi`, resolved from the atpkg store, as its child
-on your terminal. It passes every argument through, follows the child's signals and stops, and
-exits with the child's own status. When atpkg installs a newer `kimi` while a session is
+on your terminal. It passes every argument through (a launch through atpkg's `run --` envelope
+first gets what atpkg's `kimi` launcher gives a launch, see below), follows the child's signals
+and stops, and exits with the child's own status. When atpkg installs a newer `kimi` while a session is
 running, the harness waits for a safe point and resumes **the same session** on the new build,
 and the harness process never exits while it does so. A new harness build likewise crosses a safe
 point by `exec`, keeping the harness pid and leaving the vendor child running. It never ships,
@@ -12,7 +13,10 @@ forks or patches vendor bytes, and its version is independent of the vendor's.
 
 Inside aterm, atpkg's managed `kimi` twin automatically starts an installed, live `kimi-alab`
 as `kimi-alab run -- …`. `--no-harness`, `--no-alab-harness` or `ATERM_NO_HARNESS=1` keeps the
-vendor direct, and a missing or unfinished harness falls back to the vendor.
+vendor direct, and a missing or unfinished harness falls back to the vendor. Under `run --` the
+harness does the launcher's own blocks for `kimi` itself (the self-update intercept, the yolo
+default and the shim's environment), so atpkg's launcher can keep only the liveness check and
+the hand-off once the harness leads the word.
 
 ```console
 $ kimi-alab --version
@@ -35,10 +39,49 @@ kimi-alab --alab-help           help
   order (an empty word included). `--version`/`-V` belong to the harness only when they are
   the single argument; `kimi-alab -m k2 -V` passes `-V` to `kimi`.
 * In atpkg's `run --` envelope, every following word is the vendor's, including `--version` and
-  words in the `--alab-*` namespace. The envelope requires the literal `--`.
+  words in the `--alab-*` namespace, and the launcher's blocks apply to them (next section). The
+  envelope requires the literal `--`.
 * An unknown `--alab-*` flag in the leading position is refused (exit 2) so a mistyped
   harness flag never reaches the vendor.
 * `--alab-no-update` turns the live update off for that run: the store is not watched.
+
+### `run --`: the launcher's blocks, in the harness
+
+atpkg's managed `kimi` launcher (aterm `crates/atpkg/src/platform/mod.rs`, `twin_prelude`) runs,
+in order, a self-update block, a sign-in block where the program's row has a gate, and a yolo
+block, then hands the launch to the harness (`exec <prefix>/bin/kimi-alab run -- "$@"`). aterm's
+harness interface design (section 2.1, "The launcher keeps its other duties") moves each block
+into the harness's `run`, and the launcher deletes it once an index pins the harness release that
+ships it. A fresh launch through `run --` gets them from `src/launch.rs`, in the same order and
+with the same words; a bare `kimi-alab …` launch and a child adopted across a harness re-exec get
+none of them.
+
+1. **The self-update intercept.** `kimi upgrade` and `kimi update` (the first word, exactly as
+   typed: the row's `self_update_verbs`) replace the harness with `aterm pkg __selfupdate kimi
+   <prefix> -- <words>`, atpkg's hidden verb, which declines a shape it does not take, forwards
+   `update --help` to Kimi, and otherwise runs `aterm pkg update kimi`. The re-entry guard
+   `__ATPKG_SELFUPDATE_PID` is set to the harness's pid first; a forward that comes back under
+   that pid runs Kimi with the words. The launcher runs the `atpkg` it was laid by; the harness
+   runs the executable `aterm` on `PATH` (none: Kimi runs the words itself, as the launcher's
+   `[ -x ]` falls through).
+2. **The sign-in gate: none.** Kimi's row has `signin_gate: None`, and `aterm harness signin`
+   serves `--cli grok` alone, so a signed-out Kimi launch runs as it is, as under the launcher.
+3. **The yolo block.** `--no-harness` and `--no-alab-harness` ahead of a literal `--` are taken
+   off; such a launch runs Kimi in the harness's place with `ATERM_NO_HARNESS=1`, as the launcher
+   exports it. A typed `--yolo` becomes Kimi's `--auto` (once), dropping Kimi's weaker `-y`,
+   `--yes` and `--auto-approve` ahead of the first word. A launch that names nothing of its
+   posture (no marker: `--auto`, `-y`, `--yes`, `--auto-approve`, `--plan`, `-p`/`--prompt`,
+   `-S`/`--session`, `-r`/`--resume`, `-c`/`--continue`, `-C`; no management word such as
+   `login`, `acp`, `web`, `export` or a self-update word; no leading option the scan does not
+   know) gets `--auto` in front, unless it leaves the harness out (`--no-harness` or
+   `ATERM_NO_HARNESS=1`). Each rewrite prints the command as run on standard error, byte for
+   byte as the launcher prints it: `aterm: yolo (default): running 'kimi' '--auto' …` or
+   `aterm: --yolo: running 'kimi' '--auto' …`. The rule is atpkg's `yolo::decide` for `kimi`,
+   ported with its tests.
+4. **The shim's environment.** The launcher exports the build's shim environment
+   (`KIMI_CODE_NO_AUTO_UPDATE=1`) only after its hand-off, so a harness-led Kimi never had it
+   from there. The harness gives every child its build's `<build>.shim-env` and
+   `KIMI_CODE_NO_AUTO_UPDATE=1` (next section), supervised or in its place.
 
 ### Where `kimi` comes from
 
@@ -61,7 +104,9 @@ install it with `aterm pkg install kimi` — kimi-alab never runs a `kimi` found
 ```
 
 The child gets the build's `<build>.shim-env` (admitted under atpkg's own rules) and
-`KIMI_CODE_NO_AUTO_UPDATE=1`, as atpkg's shim gives it, plus two marks of the harness's own:
+`KIMI_CODE_NO_AUTO_UPDATE=1`, as atpkg's shim gives it (and its launcher does not, for a launch it
+hands to the harness), over whatever the launch's own environment says, plus two marks of the
+harness's own:
 `KIMI_ALAB_PID` (the harness's pid) and `KIMI_ALAB_DEPTH` (its nesting depth plus one).
 
 ### It never runs itself
@@ -126,7 +171,7 @@ and child keep running.
 
 **The safe point needs both halves:**
 
-* **An idle attestation**: under a proven aterm `upgrade` claim (contract 4 or 3), a fresh policy and
+* **An idle attestation**: under a proven aterm `upgrade` claim (contract 4), a fresh policy and
   status read says `agent=idle`, `composer=empty` or `placeholder`, upgrades are enabled without
   asking, and nobody is typing or holding the session. aterm's evidence is checked again at the
   actual stop point. Outside aterm (or as an explicit override), `kill -USR1 <kimi-alab pid>`
@@ -163,42 +208,46 @@ The link to aterm is the shared ALab library `alab-wire` (crate `crates/alab-wir
 `KIMI_CODE_HOME`, its session locks and its process walk). Inside aterm, the harness claims the
 session before it spawns Kimi, over the session's authenticated control socket, in this order:
 
-1. `@self harness policy` must serve contract 4 or 3 with `effective=on`; the claim is made at
-   the highest of the two it lists (alab-wire chooses). The reply is read strictly: `gen=`,
-   `contract=`, `effective=`, `relaunch=`, `upgrade=`, `upgrade_ask=` and `human_grace_s=` must
-   each be there once and in their grammar; nothing is defaulted.
-2. **The roster guard, under contract 3.** A read-only `@self native-act info` must name
-   `kimi-alab:upgrade` in its `own-image=` list (aterm's `ROSTER`). Without the row nothing is
-   claimed, not even to find out: aterm stores a contract-3 claim from a holder off its roster as
-   a foreign claim that takes every duty from its built-in engine. Contract 4 has no roster to
-   ask: aterm proves a holder by its registry row and answers one it cannot prove `ERR unproven`.
-3. The claim: `kimi-alab@<pid> contract=<4|3> scope=relaunch,upgrade version=<version>
-   [vendor=<vendor version>] [child=<pid>:<start>] [login=<label>]` (`child=` under contract 4
-   only). A contract-4 reply states the grant, `OK scope=<granted> revision=<n>`.
-4. `status` must read it back as `supervisor=kimi-alab@<pid> supervisor_proven=1` with
-   `supervisor_scope` naming every duty granted (under contract 3, both duties claimed). A claim
-   that reads otherwise is released (`meta unset supervisor`). A launch whose contract-4 grant is
-   narrower than both duties releases it too.
-5. `subscribe @self events` on a second connection. aterm acknowledges with `OK subscribe 1` and
+1. `@self harness policy` must serve contract 4 with `effective=on`. **This build claims under
+   contract 4 alone** (`contracts = [4]` in `alab-harness.toml`, `aterm::CONTRACTS`, declared
+   to alab-wire with `Config::with_contracts`): an aterm that lists no 4 (one that serves 2 and
+   3) is sent nothing after this read, never a claim at 3 (`UNCLAIMED policy contract=2,3
+   declared=4`), and Kimi runs in the harness's place (`aterm::unserved`). The reply is read
+   strictly: `gen=`, `contract=`, `effective=`, `relaunch=`, `upgrade=`, `upgrade_ask=` and
+   `human_grace_s=` must each be there once and in their grammar; nothing is defaulted.
+2. The claim: `kimi-alab@<pid> contract=4 scope=relaunch,upgrade version=<version>
+   [vendor=<vendor version>] [child=<pid>:<start>] [login=<label>]`. Its reply states the
+   grant, `OK scope=<granted> revision=<n>`. aterm proves the holder by its registry row and
+   answers one it cannot prove `ERR unproven`.
+3. `status` must read it back as `supervisor=kimi-alab@<pid> supervisor_proven=1` with
+   `supervisor_scope` naming every duty granted. A claim that reads otherwise is released (`meta
+   unset supervisor`). A launch whose grant is narrower than both duties releases it too.
+4. `subscribe @self events` on a second connection. aterm acknowledges with `OK subscribe 1` and
    `sub <local id> <sid> role=… attention=… user_title=…`, and its events name the local id
    (`EVENT <local id> restart cause=…`); a line for any other id ends the stream, which is
    reopened on the 5 s clock.
 
 After every child start, the first included, the claim is sent again naming the new child's pid
-and kernel start time and its build and account; under contract 4 its reply is the grant from
-then on.
+and kernel start time and its build and account; its reply is the grant from then on. A claim
+alab-wire makes again on its own clock (after aterm could not answer at launch, or after a link
+lost to an aterm that stopped serving 4) or on an adoption keeps to contract 4 too: while aterm
+lists no 4 none is sent and the policy is read again every 5 s, Kimi runs on unclaimed, a crash
+is passed on at once (`CRASH-PASSED-ON no-claim policy contract=2,3 declared=4`), one already
+waiting for aterm as soon as that answer is read, a restart aterm asked for is refused
+(`RESTART-REFUSED cause=… no-claim policy contract=2,3 declared=4`), and the claim is made at 4
+once aterm serves it.
 
 A noninteractive launch, `--alab-no-update`, `ATERM_NO_HARNESS=1`, a missing or older control
-socket, a policy with supervision off by configuration, a host whose roster lacks the row (under
-contract 3), or a claim that is refused, unproven or granted less than both duties makes the
-harness **exec the vendor in its place** instead. Kimi then runs under its own name with no
+socket, a policy with supervision off by configuration, a policy that serves no contract 4, or a
+claim that is refused, unproven or granted less than both duties makes the harness **exec the
+vendor in its place** instead. Kimi then runs under its own name with no
 second supervisor. If aterm is there but cannot say now (an `ERR` that asks to be retried, which
 it answers at once while it shows a dialog or its main thread is stalled; a reply later than its
 bound after the handshake, which is aterm busy, not gone; a policy off for a reason that passes),
-or serves no contract the harness can claim at yet, the child runs supervised and the whole claim
-sequence is tried again every 5 s. The same 5 s clock claims a lost claim again, and reopens a
-lost event stream, whatever else the harness is doing; each of those exchanges waits for aterm
-at most 500 ms. `kimi-alab --alab-which` names the scopes it will claim.
+the child runs supervised and the whole claim sequence is tried again every 5 s. The same 5 s
+clock claims a lost claim again, and reopens a lost event stream, whatever else the harness is
+doing; each of those exchanges waits for aterm at most 500 ms. `kimi-alab --alab-which` names
+the scopes it will claim.
 
 **Crash relaunch.** While Kimi runs, the harness follows the session id in its lock. When the
 child ends abnormally (a non-zero exit other than 129, 130, 131 and 143, or death by a signal
@@ -264,9 +313,9 @@ same claim once the halt lifts.
 
 Rust here is the Trust toolchain (`rust-toolchain.toml`: `channel = "trust"`).
 
-The aterm client is `alab-wire`, built by path from the copy of alab-harness `v0.1.0` this
+The aterm client is `alab-wire`, built by path from the copy of alab-harness `v0.7.1` this
 repository carries at `vendor/alab-harness/` (`vendor/alab-harness/crates/alab-wire`), pinned
-by that tag's git tree id in `vendor/alab-harness.pin` (decision 37). A clone builds alone: no
+by that tag's git tree id in `vendor/alab-harness.pin` (decisions 37 and 40). A clone builds alone: no
 sibling checkout and no git dependency. The copy is its own workspace (`exclude = ["vendor"]`)
 and is never edited here. alab-harness's `tools/pin <this checkout> <tag>` replaces it whole,
 then `git add -f vendor/alab-harness vendor/alab-harness.pin` and a commit take it (`-f`: the
@@ -296,6 +345,13 @@ way the harness could run itself (a store binary that is the harness, a store `k
 with a broken standard error, and a check that the OS's tty times move as the safe point
 assumes.
 
+The `run --` scenarios lay a stand-in `aterm` on `PATH` that records its calls, and cover the
+launcher's blocks: the yolo default, the typed `--yolo`, the launches that run as typed and the
+echo lines (`run_sets_the_yolo_default`), no sign-in gate for a signed-out launch inside aterm
+(`run_gates_a_signed_out_launch`), the self-update hand-over with its re-entry guard and a
+forward that comes back (`run_intercepts_self_update`), and the shim's environment supervised
+and in the harness's place (`run_sets_the_shim_env`).
+
 The aterm scenarios run the real harness binary against alab-wire's fake aterm (feature `fake`):
 a Unix socket that answers as aterm does, with the strict policy line serving contracts 2, 3 and
 4, `native-act info` with a roster, contract 4's grant and contract 3's bare `OK`, the claim read
@@ -303,8 +359,11 @@ back with its scope, the subscription acknowledged with a local id, and restart 
 can serve only contracts 2 and 3, take the row off the roster, grant fewer words, cap the claim
 between its reply and its read, halt the session, put a driver's hand or a person's typing on
 it, turn `relaunch` off, delay every reply, or make policy reads answer `ERR`. The scenarios
-cover the claim at contract 4 and at contract 3 with each child named after it starts, the
-roster and scope refusals under both contracts, a launch that meets an `ERR` and one aterm
+cover the claim at contract 4 with each child named after it starts, no claim at all against an
+aterm that serves only contracts 2 and 3, a claim made again on the clock never sent at 3 and
+made at 4 once aterm serves it, a crash after aterm drops contract 4 passed on at once, one
+that began before aterm's answer passed on once it is read, a restart waiting for aterm refused
+on that answer, the scope refusal, a launch that meets an `ERR` and one aterm
 answers late (busy, not gone), the move under a claim and under a halt, crash relaunch with the
 back-off ladder, a crash a person owns, a crash waiting out aterm's `ERR` and a signal during
 that wait, and the restart events (asked, account, a model move refused, refused under a
@@ -336,11 +395,12 @@ Read, not guessed:
   (`harness/lanes.rs:51`, `Program::Kimi => Lanes::NONE`).
 * aterm `crates/aterm-agent/src/harness/upgrade_agy.rs:44-200`: the carried-argv shape (every
   flag has a fate, an unknown flag refuses).
-* aterm `crates/atpkg/src/vendor_direct/table.rs:659-735` (the `kimi` row), `store.rs`
+* aterm 617e45d8c95 `crates/atpkg/src/vendor_direct/table.rs:797-868` (the `kimi` row), `store.rs`
   (`current`, `.ready`), `shim_env.rs`: the store layout and admission rules ported in
   `src/store.rs`.
-* alab-harness `crates/alab-wire` (README Decisions, `docs/HX-06-aterm-map-2026-11-13.md`): the
-  aterm client, contracts 3 and 4, and the exit judgement and crash ladder ported from aterm.
+* alab-harness `crates/alab-wire` (README Decisions; the HX-06 aterm map, out of its tree since
+  `v0.7.1`, is publication `goals/designs/hx06-aterm-map-2026-11-13.md`): the aterm client,
+  contracts 3 and 4, and the exit judgement and crash ladder ported from aterm.
 * aterm `crates/aterm-phase/src/kimi.rs`: the measured spinner/idle grammar and composer reader.
   aterm publishes those as `agent=` and `composer=`; the harness still applies its own terminal,
   process-tree and CPU backstops before stopping a child.
@@ -363,18 +423,17 @@ Choices made without the owner, each fail-closed and reversible:
    it is missing. It also refuses to exec a store binary that is the harness itself (same
    device and inode), on every launch and relaunch (decision 16). A config prefix outside
    `$HOME` is refused rather than followed.
-3. **Pure passthrough, no rewriting.** atpkg's `kimi` launcher applies aterm's `--yolo` alias
-   (it rewrites `--yolo` to Kimi's `--auto`) and yolo-by-default (aterm
-   `crates/atpkg/src/yolo.rs`). The harness rewrites and injects nothing: `kimi-alab --yolo`
-   passes Kimi's own `--yolo`, exactly as the vendor binary defines it. Passing every argument
-   through unchanged is the harness's contract, and an alias layer would be a second policy
-   that the resume rules would have to track.
+3. **Pure passthrough, no rewriting, outside `run --`.** A bare `kimi-alab …` launch rewrites
+   and injects nothing: `kimi-alab --yolo` passes Kimi's own `--yolo`, exactly as the vendor
+   binary defines it. A launch through atpkg's `run --` envelope gets the launcher's own
+   rewrites, which move into the harness (decision 38); a resume carries what the person typed
+   minus the posture flags either way (decision 8), so the resume rules track no second policy.
 4. **Follows `current` either way.** A rollback (atpkg pointing `current` at an older build) is
    followed like an upgrade. The harness runs what atpkg has made current; it never compares
    versions itself.
 5. **The safe point is attested, not inferred.** The harness inherits the terminal and cannot
    read the screen itself. A move needs aterm's fresh idle/composer attestation under a proven
-   claim (contract 4 or 3), or an idle attestation (`SIGUSR1`) elsewhere, plus the harness's tty,
+   claim (contract 4), or an idle attestation (`SIGUSR1`) elsewhere, plus the harness's tty,
    process-tree and CPU backstops. Without an attestation the update waits for the next launch.
    **This never blocks on a person.** The session keeps running on its build, nothing prompts,
    and nobody is asked.
@@ -653,6 +712,142 @@ Choices made without the owner, each fail-closed and reversible:
       down (d64ada4), and placeholder homes in two test fixtures (de80de5). This harness's tests
       pass against them unchanged.
 
+38. **`run` does the launcher's blocks for `kimi` (2026-11-14; aterm tracker HX-09b, the
+    harness half; aterm's harness interface design, section 2.1).** A fresh launch through
+    `run --` gets, in the launcher's order, what aterm `origin/main` 617e45d8c95's launcher does
+    for `kimi`: the self-update intercept (`platform/mod.rs` `sh_selfupdate_prelude`,
+    970-1010), no sign-in gate (`vendor_direct/table.rs` kimi row, `signin_gate: None`, 867;
+    `twin_prelude_with_launcher` adds the block only for a row with a gate, 621-633), the yolo
+    block (`sh_yolo_prelude_with_launcher`, 1023-1460, held by aterm's own tests to
+    `yolo::decide`, 340-423, and `yolo::strip_no_harness`, 450-472) and, at every spawn already,
+    the shim's environment (the row's `shim_env`, 825, which the launcher exports after its
+    hand-off, `sh_shim_body`, 1509-1518). The rows' words are copied (`yolo_flags`,
+    `yolo_markers`, `yolo_skip`, `self_update_verbs`, 825-862; `word_options` for `kimi`,
+    `yolo.rs` 211-227), and atpkg's tests for `kimi` are ported with them. The aterm half
+    (deleting the `kimi` blocks from atpkg) lands once an index pins a kimi-alab release that
+    ships these. Choices the design does not make:
+    * **The intercept runs `aterm pkg __selfupdate kimi <prefix> -- <words>`,** the same hidden
+      verb with the same operands the launcher hands its `atpkg`, so atpkg keeps classifying the
+      shape, declining, forwarding `update --help` and printing its lines; the design's "runs
+      `aterm pkg update kimi`" is what that verb does. The harness has no laid `atpkg` path, so
+      it runs the executable `aterm` on `PATH` (as the launcher's own sign-in block runs `aterm`),
+      with `pkg` ahead. It sets `__ATPKG_SELFUPDATE_PID` to its pid and replaces itself by
+      `exec`, so a forward that comes back through the launcher meets the guard under that pid.
+      No `aterm` on `PATH` falls through to Kimi, as the launcher's `[ -x ]` does.
+    * **No sign-in gate.** The plan lists "the sign-in gate" for Kimi, but its row has none and
+      `aterm harness signin` serves `--cli grok` alone; inventing one would make `run` differ
+      from the launcher it replaces. `run_gates_a_signed_out_launch` keeps the plan's name and
+      checks that a signed-out launch inside aterm runs and never asks aterm.
+    * **`--no-harness` leaves the harness out, and with it the default.** The launcher strips
+      the word and exports `ATERM_NO_HARNESS=1` and still adds `--auto`; the design moves the
+      default into the harness, which `--no-harness` skips ("unless the launch says
+      `--no-harness`"), so a `run --` launch that carries the word runs Kimi in the harness's
+      place with the variable and no default. `ATERM_NO_HARNESS=1` in the environment skips the
+      default too: it is the variable the launcher turns the word into for every later block,
+      and its sign-in block reads both. A typed `--yolo` is still expanded either way, as the
+      launcher writes it.
+    * **Only a fresh `run --` launch.** A bare `kimi-alab …` stays pure pass-through (decision
+      3), and a child adopted across a harness re-exec (whose `run --` carries the child's
+      current words) gets none of the blocks: they were applied when it started.
+    * **Words are read as bytes,** as the launcher's `sh` reads them, so a word that is not
+      UTF-8 is a bare word or an unknown option, never a refusal.
+39. **This build claims under contract 4 alone (2026-11-14; plan D11; aterm's harness interface
+    design, section 2.2).** `alab-harness.toml` says `contracts = [4]`, and `aterm::CONTRACTS`
+    says the same (a unit test reads the file). The design's rule is that a build that carries
+    a record never claims 3: aterm serves contract 3 to seed rows alone, and a 3 in the record
+    would keep aterm serving it under HX-22's rule. **alab-wire v0.7.0 closed the gap below**
+    (decision 41): the list is declared to alab-wire, and the policy read and the give-back
+    described next are deleted. As first built: alab-wire v0.1.0 claims at the highest
+    contract aterm lists and takes no list of its own, and its copy is never edited here
+    (decision 37), so the harness keeps to
+    4 itself: the launch reads the policy once before alab-wire's claim and makes no claim at all
+    against an aterm that lists no 4, running Kimi in its place as for any claim it cannot make
+    (`UNCLAIMED policy contract=2,3 (this build claims under 4)`); and after every step of the
+    link a standing claim at another contract is given back at once and Kimi runs on unclaimed.
+    The second covers what the first cannot: a policy the launch could not read (aterm busy or
+    answering `ERR`) followed by a reclaim on alab-wire's clock against an aterm that serves only
+    3, or a reclaim after aterm drops 4. Such a claim is made before it is given back, so the
+    whole rule belongs in alab-wire, as a contract list in its `Config`; until an alab-harness
+    tag carries one, the policy read and the give-back stay here. Consequence: on an aterm that
+    serves contracts 2 and 3 only (aterm `origin/main` today), kimi-alab claims nothing and runs
+    Kimi in its place. Decision 34's "4, else 3", decision 37's "claims at contract 3 where aterm
+    serves only that" and the contract-3 roster guard no longer apply; the three contract-3
+    scenarios became `against_an_aterm_without_contract_4_no_claim_is_made_and_kimi_runs_in_place`
+    and `a_claim_made_again_at_contract_3_is_given_back` (rewritten by decision 41).
+40. **alab-wire is the vendored alab-harness `v0.7.0` (2026-11-14; aterm tracker HX-08b).**
+    `tools/pin` replaced the `v0.1.0` copy whole (`tag=v0.7.0`,
+    `tree=e4c1f874aa31e5bc8b44c7762b61b086a60e2ae1`), as decision 37 says a newer tag is taken.
+    What came with it, and what this harness takes of it:
+    * **The session stream stays off** (`Config::with_stream(false)` in `aterm::config`, which
+      its unit test holds). From `v0.4.0` a contract-4 grant opens `stream @<sid> v=1` by
+      default and every record aterm sends needs an answer; this harness answers none yet, so
+      its claim stays on the `v0.1` path (renewed with `meta set supervisor`, woken by the event
+      subscription). Taking the stream is HX-19's.
+    * **The re-exec module (`alab_wire::reexec`, `v0.6.0`) is not taken.** This harness keeps
+      its own re-exec (`src/handoff.rs`); moving onto the shared one, and deleting this one, is
+      a package of its own. The relaunch grammar (`alab_wire::run`), the record vocabulary and
+      the `alab-policy` crate are not used either.
+    * **A contract-4 claim on a lost link is given back explicitly** (alab-harness Decision
+      30): aterm keeps such a claim 45 s after its connection closes, so `Link::release` on a
+      link lost inside that grace sends `meta unset supervisor` on a connection of its own, and
+      a claim made again inside it that aterm refuses releases it too. That is alab-wire's own
+      rule and needs nothing here.
+    * **The declared contracts** (`Config::with_contracts`, alab-harness Decision 33) are what
+      closes decision 39's gap; decision 41 takes them.
+    * **`v0.7.1` followed the same day** (`tree=f336fe131e00b4acf6af160469b43cac947db36f`):
+      no library change, three alab-wire test races fixed and its HX-06 planning page out of
+      the tree, so the vendored copy no longer ships that page.
+41. **The contract list is declared to alab-wire, and the harness's own guards are gone
+    (2026-11-14; aterm tracker HX-08b and HX-09b; alab-harness Decision 33).** `aterm::config`
+    declares `aterm::CONTRACTS` (`[4]`) with `Config::with_contracts`, and a unit test holds the
+    declared list, the constant and `alab-harness.toml`'s `contracts` equal. alab-wire keeps
+    every claim to it, the launch's, an adopted image's (`Link::adopt_with`), each made again on
+    its clock and one after a policy switched back on, and `claim_verb` makes no text at 3 as a
+    second fence. So decision 39's gap is closed: no claim at 3 is ever sent, where before one
+    could stand until the step's give-back. Deleted, as redundant:
+    * **`aterm::unserved(env, config)`**, the harness's own policy read on a connection of its
+      own before the launch's claim, with its `contract_words` helper. alab-wire's claim
+      sequence reads the policy and answers an aterm that lists no 4 with `Failure::Unserved`
+      (the launch is lost and unclaimed, nothing sent); `aterm::unserved(link)` is now a reader
+      of `Link::unclaimed`, and the launch runs Kimi in the harness's place on it as before. The
+      journal line is alab-wire's: `UNCLAIMED policy contract=2,3 declared=4` where it was
+      `UNCLAIMED policy contract=2,3 (this build claims under 4)`.
+    * **The give-back in `aterm::settle`**, which released a standing claim at another contract
+      after every step of the link (`UNCLAIMED contract=3 given back (this build claims under
+      4)`). What was left of it, the link's notes as journal events, is `aterm::journal_notes`.
+
+    Kept, by alab-wire's rule or here: on an aterm that lists no 4 the launch passes Kimi
+    through, as before. Later in the session (a launch aterm could not answer, then a policy of
+    2 and 3; a link lost to an aterm restarted into one) the link stays lost rather than being
+    given back and absent for the session: it reads the policy every 5 s, sends nothing, and
+    claims at 4 once aterm serves it, which the given-back link never did. A crash while aterm's
+    last answer is that one is passed on at once, as the absent link passed it on (`no-claim`),
+    rather than waiting out the 45 s budget for a claim that cannot come: `crash_begins` reads
+    `aterm::unserved(link)` (`CRASH-PASSED-ON no-claim policy contract=2,3 declared=4`). A
+    crash that began while the link was lost, before the claim made again heard that answer,
+    waits for aterm under `Link::relaunch_word`'s `Away("link-lost")`, whatever the link's last
+    failure; `crash_tick` reads `aterm::unserved(link)` on every pass, so it is passed on as
+    soon as the answer is read (about 5 s after the loss) instead of at the end of the budget
+    as `claim-not-proven-again`. `restart_now` reads it first too, so a restart aterm asked for
+    that waits then is refused at once (`RESTART-REFUSED cause=… no-claim policy
+    contract=2,3 declared=4`) instead of waiting out the restart wait. The given-back link
+    ended both once it was given back; without these checks a review measured the 45 s waits.
+    Inside aterm's re-exec grace such an answer gives back the claim aterm may have kept
+    (alab-harness Decisions 30 and 33). The scenarios now assert that no request names
+    contract 3 (no claim at 3, no contract-3 roster read):
+    `against_an_aterm_without_contract_4_no_claim_is_made_and_kimi_runs_in_place`,
+    `a_claim_made_again_never_names_contract_3_and_is_made_at_4_once_served` (which replaces
+    `a_claim_made_again_at_contract_3_is_given_back`, and claims at 4 as its control), and
+    `a_crash_after_aterm_drops_contract_4_is_passed_on_at_once_and_3_is_never_claimed`; the unit
+    test `no_claim_at_contract_3_can_be_made` holds alab-wire's fence, with the default
+    contracts as its control. Each of the three scenarios fails with the default contracts
+    declared, and the crash scenario fails without the `crash_begins` check (measured).
+    `a_crash_waiting_for_aterm_is_passed_on_once_aterm_answers_it_serves_no_4` (the crash
+    journals `CRASH-WAIT` before aterm's `UNCLAIMED` answer, its control) and
+    `a_restart_waiting_for_aterm_is_refused_once_aterm_answers_it_serves_no_4` fail without
+    the `crash_tick` and `restart_now` checks: the harness does not exit within the 30 s
+    deadline, and the restart is still waiting at it (measured).
+
 ## Verification status
 
 First measured 2026-10-24 on a clean clone of commit bd8547a, with the gate exactly as
@@ -662,12 +857,15 @@ formatting were rerun on this change on 2026-11-13, with targo straight from the
 (this Mac has no rustup, so `rustup run trust` is dropped from each step). The unverified tests,
 lint and formatting were rerun with `--locked` on 2026-11-14 after the aterm client moved to
 `alab-wire` (decision 33), again after decisions 35 and 36, and again with alab-wire built from
-the vendored v0.1.0 (decision 37); the Trust rows were not rerun on those changes:
+the vendored v0.1.0 (decision 37), and again with the launcher's blocks in `run` and contract 4
+alone (decisions 38 and 39), and again with alab-wire v0.7.0 and its declared contracts
+(decisions 40 and 41) and its crash and restart checks, and again with alab-wire v0.7.1
+(decision 40); the Trust rows were not rerun on those changes:
 
 | Step | Result |
 |---|---|
 | `targo trust check --allow-l0-gaps` (verified, advisory lane) | exit 3, `Gate: COULD-NOT-RUN [advisory lane, exit 3]`. **0 refuted.** 652 functions: 255 rows proved, 416 runtime-checked, 498 unknown. |
-| `targo --unverified test` (no proof claim) | exit 0: 72 unit, 53 integration and 1 pin test passed |
+| `targo --unverified test` (no proof claim) | exit 0: 80 unit, 59 integration and 1 pin test passed |
 | `targo tippy -- -D warnings` (clippy pedantic) | exit 0 |
 | `targo fmt --check` | exit 0 |
 | `targo trust check` (strict lane, not the gate) | exit 1 on the same unknown rows; 0 refuted (measured on 64fd067, not rerun since) |

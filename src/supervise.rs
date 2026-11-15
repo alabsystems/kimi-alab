@@ -761,6 +761,9 @@ enum Asked {
 /// (`alab_wire::relaunch::permitted` with `asked`): the claim is this harness's, proven and takes
 /// `relaunch`, the policy stands, and nobody holds the session (no halt, no other driver's
 /// hand). A request with no session yet, or one aterm could not answer, waits ([`Deferred`]).
+/// One is refused at once, whatever else it waits for, while aterm's last answer to a claim made
+/// again is that it serves no contract this build declares ([`aterm::unserved`]): no claim
+/// stands, and none can until aterm serves one.
 fn restart_now(
     cur: &Running,
     link: &mut Link,
@@ -768,6 +771,13 @@ fn restart_now(
     term_grace: Duration,
     journal: &mut Journal,
 ) -> Asked {
+    if let Some(why) = aterm::unserved(link) {
+        journal.note(
+            "RESTART-REFUSED",
+            &format!("cause={} no-claim {why}", event.cause),
+        );
+        return Asked::Refused;
+    }
     let Some(session) = cur.session.clone() else {
         return Asked::Waits {
             why: "no running child's session lock names the conversation".to_string(),
@@ -795,7 +805,7 @@ fn restart_now(
         return Asked::Refused;
     }
     let word = link.relaunch_word(true, aterm::now_ms());
-    aterm::journal(link, journal);
+    aterm::journal_notes(link, journal);
     match word {
         Relaunch::Permitted => {}
         Relaunch::Denied(why) => {
@@ -864,7 +874,7 @@ fn pass_over_earlier(
     let now = aterm::now_ms();
     link.tick(cur.claim(), now);
     let drained = link.events(cur.claim(), now);
-    aterm::journal(link, journal);
+    aterm::journal_notes(link, journal);
     if let Some(event) = drained.restart {
         journal.note(
             "RESTART-PASSED-OVER",
@@ -878,8 +888,11 @@ fn pass_over_earlier(
 
 /// Whether the child's end `status` is a crash the harness now answers: nobody passed it `HUP`
 /// or `TERM` (`ending`), the end is abnormal (`alab_wire::relaunch::abnormal_exit`), the session
-/// has a claim, the child's lock named its session, and the launch can be resumed. `Err(None)`
-/// for an end that is the session's own, `Err(Some(why))` for an abnormal end passed on.
+/// has a claim and aterm did not last answer that it serves none of this build's contracts
+/// ([`aterm::unserved`]; an answer read after the crash began passes it on in [`crash_tick`]),
+/// the child's lock named its session, and the launch can be resumed.
+/// `Err(None)` for an end that is the session's own, `Err(Some(why))` for an abnormal end passed
+/// on.
 fn crash_begins(
     status: Status,
     cur: &Running,
@@ -891,6 +904,11 @@ fn crash_begins(
     }
     if !link.claims() {
         return Err(Some("no-claim".to_string()));
+    }
+    if let Some(why) = aterm::unserved(link) {
+        // aterm's last word is that it serves no contract this build declares: no claim stands
+        // and none is made until it does, so the relaunch duty is not this harness's.
+        return Err(Some(format!("no-claim {why}")));
     }
     let Some(session) = cur.session.clone() else {
         return Err(Some(
@@ -911,7 +929,7 @@ fn crash_judged(crash: &mut Crash, link: &mut Link, journal: &mut Journal) -> Ti
     let now = Instant::now();
     let ms = aterm::now_ms();
     let word = link.relaunch_word(false, ms);
-    aterm::journal(link, journal);
+    aterm::journal_notes(link, journal);
     match word {
         Relaunch::Permitted => {
             crash.budget.answered(ms);
@@ -942,7 +960,15 @@ fn crash_judged(crash: &mut Crash, link: &mut Link, journal: &mut Journal) -> Ti
 
 /// One step of a crash being answered, on every pass of the loop while no child runs. It
 /// never waits.
+///
+/// A crash that began while the link was lost, before aterm answered the claim made again that
+/// it serves no contract this build declares ([`aterm::unserved`]), is passed on as soon as that
+/// answer is read, as [`crash_begins`] passes on one that began after it: no claim can come
+/// until aterm serves one, so the wait for aterm would only run out the 45 s budget.
 fn crash_tick(crash: &mut Crash, link: &mut Link, journal: &mut Journal) -> Tick {
+    if let Some(why) = aterm::unserved(link) {
+        return Tick::PassOn(format!("no-claim {why}"));
+    }
     let now = Instant::now();
     match crash.wait {
         CrashWait::Pause if now < crash.due => Tick::Wait,
@@ -980,7 +1006,7 @@ fn stop_point(link: &mut Link, by_aterm: bool, journal: &mut Journal) -> Result<
             Reading::Local => Ok(()),
         },
     };
-    aterm::journal(link, journal);
+    aterm::journal_notes(link, journal);
     word
 }
 
@@ -1077,7 +1103,7 @@ pub fn run(
         // An adopted child was named in its claim already.
         pass_over_earlier(&cur, &mut link, &mut deferred, journal);
         link.reannounce(cur.claim(), aterm::now_ms());
-        aterm::journal(&mut link, journal);
+        aterm::journal_notes(&mut link, journal);
     }
     let mut claim_tick = Instant::now()
         .checked_sub(settings.poll)
@@ -1108,7 +1134,7 @@ pub fn run(
             }
             link.tick(cur.claim(), aterm::now_ms());
             let drained = link.events(cur.claim(), aterm::now_ms());
-            aterm::journal(&mut link, journal);
+            aterm::journal_notes(&mut link, journal);
             if let Some(event) = drained.restart {
                 journal.note(
                     "RESTART-REFUSED",
@@ -1149,7 +1175,7 @@ pub fn run(
                     cur = next;
                     pass_over_earlier(&cur, &mut link, &mut deferred, journal);
                     link.reannounce(cur.claim(), aterm::now_ms());
-                    aterm::journal(&mut link, journal);
+                    aterm::journal_notes(&mut link, journal);
                     crash = None;
                     pending = None;
                     attest = None;
@@ -1271,7 +1297,7 @@ pub fn run(
                                 cur = next;
                                 pass_over_earlier(&cur, &mut link, &mut deferred, journal);
                                 link.reannounce(cur.claim(), aterm::now_ms());
-                                aterm::journal(&mut link, journal);
+                                aterm::journal_notes(&mut link, journal);
                                 pending = None;
                                 attest = None;
                                 aterm_attest = false;
@@ -1352,7 +1378,7 @@ pub fn run(
                         cur = next;
                         pass_over_earlier(&cur, &mut link, &mut deferred, journal);
                         link.reannounce(cur.claim(), aterm::now_ms());
-                        aterm::journal(&mut link, journal);
+                        aterm::journal_notes(&mut link, journal);
                         pending = None;
                         attest = None;
                         aterm_attest = false;
@@ -1371,7 +1397,7 @@ pub fn run(
 
         link.tick(cur.claim(), aterm::now_ms());
         let drained = link.events(cur.claim(), aterm::now_ms());
-        aterm::journal(&mut link, journal);
+        aterm::journal_notes(&mut link, journal);
         if moving.is_none() && ending.is_none() {
             let asked = drained.restart.map(|event| Deferred {
                 event,
@@ -1591,7 +1617,7 @@ pub fn run(
             let word = link
                 .judges()
                 .then(|| link.safe_point(Duration::ZERO, aterm::now_ms()));
-            aterm::journal(&mut link, journal);
+            aterm::journal_notes(&mut link, journal);
             match word {
                 Some(Word::Safe) if attest.is_none() => {
                     attest = Some(Attestation::now());

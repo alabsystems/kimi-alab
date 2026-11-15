@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::fake::{FakeAterm, POLICY_ON};
+use crate::stream::{self, Incoming};
 
 const ID: &str = "example-alab";
 /// How long a scenario waits for the fake's threads before it fails.
@@ -45,8 +46,11 @@ fn a_refused_reply_is_two_journal_words() {
     assert_eq!(reply_words(""), "reply=(empty)");
 }
 
+/// The contracts a config declares unless it says otherwise: 3 and 4.
+const BOTH: [Contract; 2] = Config::DEFAULT_CONTRACTS;
+
 #[test]
-fn a_policy_admits_a_claim_only_with_contract_three_or_four_in_effect() {
+fn a_policy_admits_a_claim_only_with_a_declared_contract_in_effect() {
     let policy = |contract: &str, effective: &str| {
         Policy::parse(&format!(
             "OK gen=1 effective={effective} contract={contract} relaunch=true upgrade=true \
@@ -54,15 +58,27 @@ fn a_policy_admits_a_claim_only_with_contract_three_or_four_in_effect() {
         ))
         .expect("a policy")
     };
+    let admits = |policy: &Policy| admits(policy, &BOTH);
     assert_eq!(admits(&policy("2,3", "on")), Ok(()));
     assert_eq!(admits(&policy("4", "on")), Ok(()));
     assert_eq!(admits(&policy("2,3,4", "on")), Ok(()));
-    // An aterm that serves no contract this library speaks may serve one
+    // An aterm that serves no contract the harness declares may serve one
     // after its update: asked again on the clock.
     assert_eq!(
         admits(&policy("2", "on")),
-        Err(Failure::Unserved("policy contract=2".to_string()))
+        Err(Failure::Unserved(
+            "policy contract=2 declared=3,4".to_string()
+        ))
     );
+    // A harness that declares `[4]` (D11) is not admitted by `2,3`.
+    let four = [Contract::Four];
+    assert_eq!(
+        super::admits(&policy("2,3", "on"), &four),
+        Err(Failure::Unserved(
+            "policy contract=2,3 declared=4".to_string()
+        ))
+    );
+    assert_eq!(super::admits(&policy("2,3,4", "on"), &four), Ok(()));
     // Off by a setting a person can switch on again while the session
     // runs, or by a fact of the window that stands.
     for why in ["disabled", "agent-off", "autopilot-off"] {
@@ -93,7 +109,7 @@ fn a_policy_admits_a_claim_only_with_contract_three_or_four_in_effect() {
     // policy this library reads.
     assert_eq!(
         admits(&policy("2,5", "off")).unwrap_err().why(),
-        "policy contract=2,5"
+        "policy contract=2,5 declared=3,4"
     );
 }
 
@@ -866,7 +882,7 @@ fn a_lost_link_reclaimed_against_an_aterm_serving_only_contract_2_drops_its_hold
         link.take_notes();
         let why = if unserved {
             fake.serve_contracts(&[2]);
-            "policy contract=2"
+            "policy contract=2 declared=3,4"
         } else {
             fake.set_policy(
                 &POLICY_ON.replace("effective=on why=enabled", "effective=off why=hold"),
@@ -1055,7 +1071,7 @@ fn a_fresh_read_gives_the_harness_aterms_facts_to_judge_by_its_own_rule() {
         panic!("a standing claim reads fresh");
     };
     let Facts { policy, status } = *facts;
-    assert!(policy.upgrade_ask && policy.admits_claim());
+    assert!(policy.upgrade_ask && policy.admits_claim(&BOTH));
     assert!(status.held_by(&holder));
     assert_eq!(status.hold.as_deref(), Some("0"));
     assert_eq!(status.hand.as_deref(), Some("-"));
@@ -1485,7 +1501,16 @@ fn an_aterm_serving_only_contract_2_is_claimed_at_4_once_it_serves_4() {
     let mut clock = Clock::new();
     let mut link = launch(&fake, &clock);
     assert!(link.is_lost() && !link.claims() && !link.judges());
-    assert_eq!(link.take_notes(), ["aterm unclaimed policy contract=2"]);
+    assert_eq!(
+        link.take_notes(),
+        ["aterm unclaimed policy contract=2 declared=3,4"]
+    );
+    assert_eq!(
+        link.unclaimed(),
+        Some(&Failure::Unserved(
+            "policy contract=2 declared=3,4".to_string()
+        ))
+    );
     assert_eq!(fake.verbs(), ["harness policy"]);
     // Nothing is claimed, or noted again, while aterm still serves 2 alone.
     clock.pass(RECLAIM_EVERY_MS);
@@ -1503,6 +1528,193 @@ fn an_aterm_serving_only_contract_2_is_claimed_at_4_once_it_serves_4() {
     );
     let holder = config.holder(std::process::id());
     assert_eq!(fake.holder().as_deref(), Some(holder.as_str()));
+    link.release(clock.now());
+}
+
+/// A config declaring contract 4 alone, as every harness's record does (D11).
+fn four_config() -> Config {
+    config()
+        .with_contracts(&[Contract::Four])
+        .expect("a config")
+}
+
+/// Whether `verbs` hold a claim under contract 3 or the roster read that
+/// comes before one.
+fn any_contract_3(verbs: &[String]) -> bool {
+    verbs.iter().any(|verb| {
+        verb == "native-act info"
+            || (verb.starts_with("meta set supervisor ") && !verb.contains(" contract=4 "))
+    })
+}
+
+/// A harness that declares `[4]` (D11) never claims 3. Against an aterm that
+/// serves `2,3` and rosters it, a launch reads the policy and sends nothing
+/// more: no roster read, no claim. The link reports the policy unserved
+/// (`Link::unclaimed`, and the note), so its caller can pass its vendor
+/// through or run it unclaimed, and reads the policy again on the reclaim
+/// clock, claiming at 4 once aterm serves 4. An adopted child's link
+/// (`Link::adopt_with`) keeps to the same contracts: it gives back the claim
+/// its earlier image may have left in aterm's re-exec grace, once, and claims
+/// nothing.
+/// NEGATIVE CONTROL: the default config, against the same aterm, claims at 3.
+#[test]
+fn a_link_that_declares_four_never_claims_three() {
+    let four = four_config();
+    let why = "policy contract=2,3 declared=4";
+    let fake = FakeAterm::for_harness("declares-four", &four);
+    fake.serve_contracts(&[2, 3]);
+    let mut clock = Clock::new();
+    let mut link = launch_as(&fake, &clock, four.clone(), child());
+    assert!(link.is_lost() && !link.claims() && !link.judges());
+    assert_eq!(link.take_notes(), [format!("aterm unclaimed {why}")]);
+    assert_eq!(link.unclaimed(), Some(&Failure::Unserved(why.to_string())));
+    assert_eq!(fake.verbs(), ["harness policy"]);
+    // Read again on the clock, noted once, and nothing past the policy.
+    for _ in 0..3 {
+        clock.pass(RECLAIM_EVERY_MS);
+        link.tick(child(), clock.now());
+        assert!(link.is_lost() && !link.claims() && link.grant().is_none());
+    }
+    assert!(link.take_notes().is_empty());
+    assert_eq!(fake.verbs(), ["harness policy"; 4]);
+    assert_eq!(fake.holder(), None);
+    // aterm serves 4: the claim is made there.
+    fake.serve_contracts(&[2, 3, 4]);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Four),
+        "{:?}",
+        link.take_notes()
+    );
+    assert_eq!(link.unclaimed(), None);
+    let holder = four.holder(std::process::id());
+    assert_eq!(fake.holder().as_deref(), Some(holder.as_str()));
+    assert!(!any_contract_3(&fake.verbs()), "{:?}", fake.verbs());
+    link.release(clock.now());
+
+    // An adopted child's link: lost and claimed, never at 3.
+    let adopted = FakeAterm::for_harness("adopts-four", &four);
+    adopted.serve_contracts(&[2, 3]);
+    let lookup = adopted.lookup(four.env());
+    let mut link = Link::adopt_with(
+        four.clone(),
+        std::process::id(),
+        child(),
+        clock.now(),
+        lookup,
+    );
+    assert!(link.is_lost() && link.claims() && !link.judges());
+    assert_eq!(link.take_notes(), [format!("aterm unclaimed {why}")]);
+    assert_eq!(link.unclaimed(), Some(&Failure::Unserved(why.to_string())));
+    let policy = "harness policy".to_string();
+    let release = format!("meta unset supervisor holder={holder}");
+    assert_eq!(adopted.verbs(), [policy.clone(), release.clone()]);
+    // That answer gave the claim back, so neither a reclaim nor the link's
+    // release gives it back again within the grace: the reclaim reads the
+    // policy alone.
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.is_lost() && link.grant().is_none());
+    assert_eq!(adopted.verbs(), [policy.clone(), release.clone(), policy]);
+    assert_eq!(adopted.holder(), None);
+    link.release(clock.now());
+    assert_eq!(adopted.verbs().len(), 3, "{:?}", adopted.verbs());
+
+    // NEGATIVE CONTROL: declaring 3 and 4, the same aterm is claimed at 3.
+    let control = FakeAterm::for_harness("declares-both", &config());
+    control.serve_contracts(&[2, 3]);
+    let mut link = launch(&control, &clock);
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Three)
+    );
+    assert!(any_contract_3(&control.verbs()), "{:?}", control.verbs());
+    link.release(clock.now());
+}
+
+/// A held contract-4 link of a harness that declares `[4]`, lost to an aterm
+/// restart into one serving `2,3` (with this harness on its contract-3
+/// roster), is claimed again only under 4. Past several reclaim periods aterm
+/// hears policy reads and, once, the release of the claim it may have kept
+/// through its re-exec grace (Decision 30), and no roster read or claim; once
+/// it serves 4 again the link is claimed at 4.
+/// NEGATIVE CONTROL: the default config, through the same restart, reclaims at 3.
+#[test]
+fn a_reclaim_keeps_to_the_declared_contracts() {
+    let four = four_config();
+    let holder = four.holder(std::process::id());
+    let fake = FakeAterm::for_harness("reclaims-four", &four);
+    let mut clock = Clock::new();
+    let mut link = launch_as(&fake, &clock, four.clone(), child());
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Four)
+    );
+    fake.restart();
+    fake.serve_contracts(&[2, 3]);
+    assert!(matches!(
+        link.relaunch_word(false, clock.now()),
+        Relaunch::Away(_)
+    ));
+    assert!(link.is_lost() && link.claims());
+    link.take_notes();
+    let before = fake.verbs().len();
+    for _ in 0..4 {
+        clock.pass(RECLAIM_EVERY_MS);
+        link.tick(child(), clock.now());
+        assert!(link.is_lost() && link.claims() && link.grant().is_none());
+    }
+    let why = "policy contract=2,3 declared=4";
+    assert_eq!(link.take_notes(), [format!("aterm unclaimed {why}")]);
+    assert_eq!(link.unclaimed(), Some(&Failure::Unserved(why.to_string())));
+    let release = format!("meta unset supervisor holder={holder}");
+    let policy = "harness policy".to_string();
+    assert_eq!(
+        fake.verbs()[before..],
+        [
+            policy.clone(),
+            release,
+            policy.clone(),
+            policy.clone(),
+            policy
+        ]
+    );
+    assert_eq!(fake.holder(), None);
+    // aterm serves 4 again: the link is claimed at 4.
+    fake.serve_contracts(&[2, 3, 4]);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Four),
+        "{:?}",
+        link.take_notes()
+    );
+    assert_eq!(fake.holder().as_deref(), Some(holder.as_str()));
+    assert!(!any_contract_3(&fake.verbs()), "{:?}", fake.verbs());
+    link.release(clock.now());
+
+    // NEGATIVE CONTROL: declaring 3 and 4, the same restart is reclaimed at 3.
+    let control = FakeAterm::for_harness("reclaims-both", &config());
+    let mut link = launch(&control, &clock);
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Four)
+    );
+    control.restart();
+    control.serve_contracts(&[2, 3]);
+    assert!(matches!(
+        link.relaunch_word(false, clock.now()),
+        Relaunch::Away(_)
+    ));
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Three)
+    );
     link.release(clock.now());
 }
 
@@ -1528,4 +1740,1277 @@ fn an_unregistered_contract_4_holder_answered_err_unproven_is_refused() {
         "{:?}",
         fake.verbs()
     );
+}
+
+// ──────────────────────────────── the session stream ────────────────────────────────
+
+/// The caller's wall clock in these scenarios: milliseconds since 1970.
+const WALL: u64 = 1_794_000_000_000;
+
+/// A record any stream applies: `title` needs no scope.
+fn title() -> Body {
+    Body::Title {
+        title: Some("the session".to_string()),
+        summary: None,
+    }
+}
+
+/// A `session` record that takes `takes`.
+fn session(takes: &[record::Kind]) -> Body {
+    Body::Session {
+        agent: "example".to_string(),
+        version: "0.2.0".to_string(),
+        vendor: Some("2.1.311".to_string()),
+        account: None,
+        conversation: None,
+        cwd: None,
+        resume: Vec::new(),
+        mode: record::Mode::Tui,
+        takes: takes.to_vec(),
+    }
+}
+
+fn eventually(what: &str, mut holds: impl FnMut() -> bool) {
+    let until = Instant::now() + HANG;
+    while !holds() {
+        assert!(Instant::now() < until, "hang detector: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A fake that serves the stream, set up by `setup` before the launch at `now_ms`.
+fn served(name: &str, setup: impl FnOnce(&FakeAterm)) -> FakeAterm {
+    let fake = FakeAterm::for_harness(name, &config());
+    fake.serve_stream(true);
+    setup(&fake);
+    fake
+}
+
+fn launched(fake: &FakeAterm, config: Config, child: Child<'_>, now_ms: u64) -> Link {
+    let lookup = fake.lookup(config.env());
+    Link::launch_with(config, std::process::id(), child, now_ms, lookup)
+}
+
+/// A launch at `now_ms` on a fake that serves the stream, which it opens.
+fn streamed_at(name: &str, child: Child<'_>, now_ms: u64) -> (FakeAterm, Link) {
+    let fake = served(name, |_| {});
+    let link = launched(&fake, config(), child, now_ms);
+    assert!(link.streaming(), "the stream opened");
+    (fake, link)
+}
+
+/// Read the link until `wanted` holds of everything read so far, waiting on the stream's
+/// descriptor: the drains gathered.
+fn await_stream(
+    what: &str,
+    link: &mut Link,
+    now_ms: u64,
+    wanted: impl Fn(&Drained, &Link) -> bool,
+) -> Drained {
+    let until = Instant::now() + HANG;
+    let mut gathered = Drained::default();
+    loop {
+        if let Some(fd) = link.stream_fd() {
+            let mut probe = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: probe is one initialized poll record for the link's open descriptor.
+            let _ = unsafe { libc::poll(&raw mut probe, 1, 50) };
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let drained = link.events(child(), now_ms);
+        gathered.drained |= drained.drained;
+        gathered.restart = drained.restart.or(gathered.restart);
+        gathered.incoming.extend(drained.incoming);
+        gathered.hand = drained.hand.or(gathered.hand);
+        gathered.policy = drained.policy.or(gathered.policy);
+        gathered.fresh |= drained.fresh;
+        gathered.renumbered.extend(drained.renumbered);
+        if wanted(&gathered, link) {
+            return gathered;
+        }
+        assert!(Instant::now() < until, "hang detector: {what}");
+    }
+}
+
+/// Wait until the open's `hand` and `policy` are answered, and their answers acknowledged.
+fn settle_open(fake: &FakeAterm, link: &mut Link, now_ms: u64) -> Drained {
+    let drained = await_stream("the open's records answered", link, now_ms, |_, link| {
+        link.counts().acks >= 2
+    });
+    assert_eq!(fake.took(), [1, 2]);
+    drained
+}
+
+/// The harness records the fake applied or dropped, as `(seq, kind)`.
+fn received(fake: &FakeAterm) -> Vec<(u64, String)> {
+    fake.stream_records()
+        .into_iter()
+        .map(|record| (record.seq, record.body.word().to_string()))
+        .collect()
+}
+
+/// Lose the stream by closing it at aterm, and wait until the link knows.
+fn close_and_lose(fake: &FakeAterm, link: &mut Link, now_ms: u64) {
+    fake.close_stream();
+    await_stream("the closed stream", link, now_ms, |_, link| link.is_lost());
+}
+
+/// Under a contract-4 grant the link sends `stream` on the claim's connection, which carries
+/// records from its `OK`; every read goes on a second request connection; the subscription is
+/// kept; the caller's records go on the stream, and the link's own kinds are not the caller's.
+#[test]
+fn a_link_streams_on_the_claims_connection_and_reads_on_a_second() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("streams", child(), clock.now());
+    let claimed = fake.claim_connection().expect("the claim");
+    assert_eq!(fake.stream_connection(), Some(claimed));
+    assert_eq!(fake.streams_opened(), [claimed]);
+    assert_eq!(fake.stream_requests(), 1);
+    let notes = link.take_notes();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(
+        notes[1],
+        "aterm streaming epoch=fake-1 acked=0 in=0 resent=0"
+    );
+    assert_eq!(link.epoch(), Some("fake-1"));
+    let opened = settle_open(&fake, &mut link, clock.now());
+    assert!(
+        opened.fresh,
+        "the first stream holds nothing of the caller's"
+    );
+
+    let before = fake.requests().len();
+    assert!(matches!(link.read(clock.now()), Reading::Fresh(_)));
+    let reads = fake.requests().split_off(before);
+    assert_eq!(
+        reads
+            .iter()
+            .map(|(_, verb)| verb.as_str())
+            .collect::<Vec<_>>(),
+        ["harness policy", "status"]
+    );
+    assert!(reads.iter().all(|(id, _)| *id != claimed), "{reads:?}");
+    assert!(link.event_fd().is_some() && link.stream_fd().is_some());
+    assert_eq!(fake.subscriptions(), 1);
+
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(3));
+    eventually("the state record", || fake.acks().len() >= 3);
+    assert_eq!(fake.acks()[2], (3, None));
+    assert_eq!(received(&fake)[2], (3, "title".to_string()));
+    for own in [Body::Beat, Body::Took { of: 1 }, Body::Want, Body::Policy] {
+        assert_eq!(
+            link.send(own.clone(), WALL, clock.now()),
+            Err(SendError::Kind(own.word().to_string()))
+        );
+    }
+    assert_eq!(
+        fake.verbs()
+            .iter()
+            .filter(|verb| verb.starts_with("meta set"))
+            .count(),
+        1
+    );
+    link.release(clock.now());
+}
+
+/// A stream that closes loses the link; the claim is made again on the reclaim clock and the
+/// records aterm did not acknowledge are written again, under their own numbers, from `acked=`.
+#[test]
+fn a_reconnect_resends_from_acked() {
+    let mut clock = Clock::new();
+    let (fake, mut link) = streamed_at("resend", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    link.take_notes();
+    // aterm takes in the next three records and applies none of them before the stream ends.
+    // The fake reads them on its connection's own thread, maybe after the link wrote them all,
+    // so it stays deaf until the stream has closed.
+    fake.set_stream_deaf(true);
+    for seq in 3..=5 {
+        assert_eq!(link.send(title(), WALL, clock.now()), Ok(seq));
+    }
+    close_and_lose(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(false);
+    assert_eq!(link.take_notes(), ["aterm lost stream closed"]);
+    // Kept while lost: written when the stream is back.
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(6));
+    assert_eq!(link.epoch(), Some("fake-1"));
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.streaming());
+    let notes = link.take_notes();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(
+        notes[1],
+        "aterm streaming epoch=fake-1 acked=2 in=2 resent=4"
+    );
+    eventually("the resend", || fake.stream_numbers().0 >= 6);
+    assert_eq!(
+        received(&fake)[2..6],
+        [3, 4, 5, 6].map(|seq| (seq, "title".to_string()))
+    );
+    assert_eq!(link.counts().resent, 4);
+    assert_eq!(fake.streams_opened().len(), 2);
+    let again = await_stream("the reopen", &mut link, clock.now(), |_, link| {
+        link.counts().acks >= 8
+    });
+    assert!(!again.fresh && again.renumbered.is_empty(), "{again:?}");
+    link.release(clock.now());
+}
+
+/// Every number the link gave stays the record's when a stream opens again in the same epoch,
+/// a beat between the caller's records included.
+#[test]
+fn a_seq_stays_the_records_across_a_reopen_in_the_same_epoch() {
+    let t = 4_000_000;
+    let (fake, mut link) = streamed_at("same-numbers", child(), t);
+    settle_open(&fake, &mut link, t);
+    fake.set_stream_deaf(true);
+    assert_eq!(link.send(title(), WALL, t), Ok(3));
+    link.tick(child(), t + BEAT_EVERY_MS);
+    assert_eq!(link.send(title(), WALL, t + BEAT_EVERY_MS), Ok(5));
+    close_and_lose(&fake, &mut link, t + BEAT_EVERY_MS);
+    fake.set_stream_deaf(false);
+    link.tick(child(), t + BEAT_EVERY_MS + RECLAIM_EVERY_MS);
+    assert!(link.streaming());
+    eventually("the resend", || fake.stream_numbers().0 >= 5);
+    assert_eq!(
+        received(&fake)[2..5],
+        [
+            (3, "title".to_string()),
+            (4, "beat".to_string()),
+            (5, "title".to_string())
+        ]
+    );
+    link.release(t + BEAT_EVERY_MS + RECLAIM_EVERY_MS);
+}
+
+/// A `beat` goes out every ten seconds of the caller's `now_ms`, from the stream's open, and a
+/// late tick sends one; each is stamped from the caller's wall clock.
+#[test]
+fn a_beat_is_sent_every_ten_seconds_of_the_callers_clock() {
+    let t = 5_000_000;
+    let (fake, mut link) = streamed_at("beats", child(), t);
+    settle_open(&fake, &mut link, t);
+    assert_eq!(link.send(title(), WALL, t), Ok(3));
+    // Each tick is followed by a record, which the fake acknowledges after any beat it sent.
+    let beats_by = |link: &mut Link, now_ms: u64| {
+        link.tick(child(), now_ms);
+        let seq = link.send(title(), WALL, now_ms).expect("the mark");
+        eventually("the mark", || fake.stream_numbers().0 >= seq);
+        fake.beats()
+    };
+    assert_eq!(beats_by(&mut link, t + BEAT_EVERY_MS - 1), 0);
+    assert_eq!(beats_by(&mut link, t + BEAT_EVERY_MS), 1);
+    assert_eq!(beats_by(&mut link, t + 2 * BEAT_EVERY_MS - 1), 1);
+    assert_eq!(beats_by(&mut link, t + 2 * BEAT_EVERY_MS), 2);
+    // A tick 45 s late sends one beat, not the four it missed.
+    assert_eq!(beats_by(&mut link, t + 65_000), 3);
+    assert_eq!(beats_by(&mut link, t + 65_000 + BEAT_EVERY_MS - 1), 3);
+    assert_eq!(beats_by(&mut link, t + 65_000 + BEAT_EVERY_MS), 4);
+    let beats: Vec<u64> = fake
+        .stream_records()
+        .into_iter()
+        .filter(|record| record.body == Body::Beat)
+        .map(|record| record.ms)
+        .collect();
+    // The caller's last record before each beat was stamped WALL at the tick before it.
+    assert_eq!(
+        beats,
+        [
+            WALL + 1,
+            WALL + 1,
+            WALL + 65_000 - (2 * BEAT_EVERY_MS),
+            WALL + 1
+        ]
+    );
+    link.release(t + 80_000);
+}
+
+/// Before the caller's first record the link's records are stamped from a wall clock it gave;
+/// beats pause while the stream stays, and go again; the link names when it is next due.
+#[test]
+fn beats_pause_and_are_stamped_from_a_wall_clock_given_before_any_record() {
+    let t = 6_000_000;
+    let (fake, mut link) = streamed_at("wall", child(), t);
+    settle_open(&fake, &mut link, t);
+    assert_eq!(link.due_ms(), Some(t + BEAT_EVERY_MS));
+    link.set_wall(WALL, t);
+    link.set_beating(false, t);
+    link.tick(child(), t + 3 * BEAT_EVERY_MS);
+    assert_eq!(
+        link.due_ms(),
+        None,
+        "nothing on the clock while beats pause"
+    );
+    link.set_beating(true, t + 3 * BEAT_EVERY_MS);
+    link.tick(child(), t + 3 * BEAT_EVERY_MS);
+    eventually("the beat", || fake.beats() == 1);
+    assert!(link.streaming() && fake.streaming());
+    let beat = fake
+        .stream_records()
+        .into_iter()
+        .find(|record| record.body == Body::Beat)
+        .expect("the beat");
+    assert_eq!(beat.ms, WALL + 3 * BEAT_EVERY_MS);
+    assert_eq!(link.due_ms(), Some(t + 4 * BEAT_EVERY_MS));
+    link.release(t + 3 * BEAT_EVERY_MS);
+}
+
+/// A `policy` record makes the link read the grant again on the second connection; the
+/// subscription's `EVENT harness-policy` and `EVENT restart` are passed over while it streams.
+#[test]
+fn a_policy_record_rereads_the_grant() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("policy-record", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    link.take_notes();
+    let stream = fake.stream_connection().expect("the stream");
+    let before = fake.requests().len();
+    fake.event("harness-policy gen=9");
+    fake.event("restart cause=asked");
+    std::thread::sleep(Duration::from_millis(200));
+    let mut restart = None;
+    for _ in 0..3 {
+        restart = restart.or(link.events(child(), clock.now()).restart);
+    }
+    assert_eq!(restart, None, "EVENT restart is not the stream's");
+    assert_eq!(
+        fake.requests().len(),
+        before,
+        "EVENT harness-policy read nothing"
+    );
+
+    fake.set_cap(Some(&[Scope::Upgrade]));
+    let drained = await_stream("the narrowing", &mut link, clock.now(), |_, link| {
+        !link.takes(Scope::Relaunch)
+    });
+    assert_eq!(drained.policy, Some(3), "the policy record heard");
+    assert_eq!(
+        link.take_notes(),
+        ["aterm narrowed scope=upgrade revision=2"]
+    );
+    let reads = fake.requests().split_off(before);
+    assert_eq!(
+        reads
+            .iter()
+            .map(|(_, verb)| verb.as_str())
+            .collect::<Vec<_>>(),
+        ["harness policy", "status"],
+        "one read for the record and its EVENT"
+    );
+    assert!(reads.iter().all(|(id, _)| *id != stream));
+    eventually("the policy answered", || fake.took().contains(&3));
+    link.release(clock.now());
+}
+
+/// `release` gives the claim back on the second connection; aterm closes the stream with it,
+/// and nothing is kept to send.
+#[test]
+fn release_goes_on_the_second_connection() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("release", child(), clock.now());
+    let stream = fake.stream_connection().expect("the stream");
+    let holder = config().holder(std::process::id());
+    link.release(clock.now());
+    let (id, verb) = fake.requests().pop().expect("the release");
+    assert_eq!(verb, format!("meta unset supervisor holder={holder}"));
+    assert_ne!(id, stream);
+    assert_eq!(fake.holder(), None);
+    eventually("the stream closed", || !fake.streaming());
+    assert!(link.is_absent() && !link.streaming() && link.epoch().is_none());
+    assert_eq!(
+        link.send(title(), WALL, clock.now()),
+        Err(SendError::NoStream)
+    );
+}
+
+/// aterm keeps a lost contract-4 claim through its re-exec grace, so a harness that exits while
+/// its link is lost gives it back on a connection of its own; and a claim made again inside the
+/// grace that aterm refuses gives it back too, so it never outlives the harness's word.
+#[test]
+fn a_contract_4_claim_kept_through_the_grace_is_released_explicitly() {
+    let mut clock = Clock::new();
+    let holder = config().holder(std::process::id());
+    let release = format!("meta unset supervisor holder={holder}");
+    let fake = served("grace-release", |fake| fake.set_reexec_grace(true));
+    let mut link = launched(&fake, config(), child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    close_and_lose(&fake, &mut link, clock.now());
+    // The fake unbinds the claim on its connection's own thread, once its
+    // read ends, which can come after the link found the stream closed.
+    eventually("the claim kept through the grace", || fake.in_grace());
+    assert!(fake.holder().is_some());
+    link.release(clock.now());
+    let (id, verb) = fake.requests().pop().expect("the release");
+    assert_eq!(verb, release);
+    assert!(id > 1, "on a connection of its own");
+    assert_eq!(fake.holder(), None);
+
+    let fake = served("grace-refused", |fake| fake.set_reexec_grace(true));
+    let mut link = launched(&fake, config(), child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    close_and_lose(&fake, &mut link, clock.now());
+    fake.set_policy(&POLICY_ON.replace("effective=on why=enabled", "effective=off why=disabled"));
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.is_lost());
+    assert_eq!(
+        fake.holder(),
+        None,
+        "the refused reclaim gave the claim back"
+    );
+    assert_eq!(
+        fake.verbs().iter().filter(|verb| **verb == release).count(),
+        1
+    );
+    let before = fake.requests().len();
+    link.release(clock.now());
+    assert_eq!(fake.requests().len(), before, "nothing of it stands");
+}
+
+/// Every record aterm sends is answered once. The link answers what it acts on (`hand`,
+/// `policy`, `restart`), a kind it does not know (`took`, ignored and counted) and what is not
+/// the caller's; the caller answers `want` and the kinds its `session` takes, and may refuse one.
+#[test]
+fn each_aterm_record_is_answered_took_or_refused() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("answers", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    use record::Kind as K;
+    assert_eq!(
+        link.send(
+            session(&[K::Prompt, K::Answer, K::Touch]),
+            WALL,
+            clock.now()
+        ),
+        Ok(3)
+    );
+    eventually("the session applied", || fake.stream_numbers().0 >= 3);
+    let prompt = Incoming::Prompt {
+        text: "go on".to_string(),
+        by: record::By::Person,
+    };
+    let answer = Incoming::Answer {
+        ask: 7,
+        option: Some("yes".to_string()),
+        text: None,
+        by: record::By::Ctl,
+        human_seq: 12,
+    };
+    for body in [
+        Body::Hand {
+            human_seq: 3,
+            composer: record::Composer::Empty,
+            hold: false,
+        },
+        Body::Policy,
+        Body::Restart {
+            cause: "asked".to_string(),
+            account: None,
+            model: None,
+        },
+        Body::Want,
+        Body::Prompt {
+            text: "go on".to_string(),
+            by: record::By::Person,
+        },
+        Body::Answer {
+            ask: 7,
+            option: Some("yes".to_string()),
+            text: None,
+            by: record::By::Ctl,
+            human_seq: 12,
+        },
+        Body::Touch { ask: 7 },
+        Body::Interrupt,
+        Body::Set {
+            model: Some("opus".to_string()),
+            effort: None,
+            mode: None,
+        },
+        Body::Unknown {
+            k: "later".to_string(),
+        },
+        Body::Beat,
+    ] {
+        assert!(fake.send_record(body));
+    }
+    // The fake's writer thread can send the records after the caller's four (10 to 13, which
+    // the link answers itself) after those four were read, and only the link's reads answer
+    // them: wait until it has answered all nine of its own, the open's two and these seven.
+    let drained = await_stream(
+        "every record read",
+        &mut link,
+        clock.now(),
+        |drained, link| {
+            let counts = link.counts();
+            drained.incoming.len() == 4 && counts.took + counts.declined == 9
+        },
+    );
+    assert_eq!(
+        drained.incoming,
+        [
+            Received {
+                of: 6,
+                incoming: Incoming::Want
+            },
+            Received {
+                of: 7,
+                incoming: prompt
+            },
+            Received {
+                of: 8,
+                incoming: answer
+            },
+            Received {
+                of: 9,
+                incoming: Incoming::Touch { ask: 7 }
+            },
+        ]
+    );
+    assert_eq!(
+        drained.restart.map(|restart| restart.cause).as_deref(),
+        Some("asked")
+    );
+    for of in [6, 7, 9] {
+        assert_eq!(link.answer(of, None, clock.now()), Ok(()));
+    }
+    assert_eq!(link.answer(8, Some("ask answered"), clock.now()), Ok(()));
+    assert_eq!(
+        link.answer(8, None, clock.now()),
+        Err(AnswerError::NotAwaited(8))
+    );
+    assert_eq!(
+        link.answer(10, None, clock.now()),
+        Err(AnswerError::NotAwaited(10))
+    );
+    eventually("every answer", || {
+        fake.took().len() + fake.refused().len() == 13
+    });
+    let mut took = fake.took();
+    took.sort_unstable();
+    assert_eq!(took, [1, 2, 3, 4, 5, 6, 7, 9, 12]);
+    let mut refused = fake.refused();
+    refused.sort_unstable();
+    assert_eq!(
+        refused,
+        [
+            (8, "ask answered".to_string()),
+            (10, "not taken".to_string()),
+            (11, "not taken".to_string()),
+            (13, "harness kind".to_string()),
+        ]
+    );
+    let counts = link.counts();
+    assert_eq!((counts.took, counts.declined), (9, 4));
+    assert_eq!(
+        (
+            counts.unknown_kinds,
+            counts.hands,
+            counts.policies,
+            counts.restarts
+        ),
+        (1, 2, 2, 1)
+    );
+    // `want` goes to every stream: a link whose caller declared nothing still passes it up.
+    let (other, mut bare) = streamed_at("answers-bare", child(), clock.now());
+    settle_open(&other, &mut bare, clock.now());
+    assert!(other.send_record(Body::Want));
+    let drained = await_stream("the want", &mut bare, clock.now(), |drained, _| {
+        !drained.incoming.is_empty()
+    });
+    assert_eq!(drained.incoming[0].of, 3);
+    assert_eq!(bare.answer(3, None, clock.now()), Ok(()));
+    eventually("the want answered", || other.took() == [1, 2, 3]);
+    link.release(clock.now());
+    bare.release(clock.now());
+}
+
+/// A `restart` record is the claim's [`Restart`], a `hand` record fills the hand fields of
+/// [`Link::status`] and is returned as [`Drained::hand`], and a reannounce is a `claim` record,
+/// which aterm places as a claim.
+#[test]
+fn restart_hand_and_reannounce_map_to_restart_status_and_a_claim_record() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("mapped", started(5151, 77, "2.1.311"), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    link.take_notes();
+
+    fake.send_model_restart("model", "opus[1m]");
+    let drained = await_stream("the restart", &mut link, clock.now(), |drained, _| {
+        drained.restart.is_some()
+    });
+    assert_eq!(
+        drained.restart,
+        Some(Restart {
+            cause: "model".to_string(),
+            account: None,
+            model: Some("opus[1m]".to_string()),
+        })
+    );
+    assert_eq!(link.relaunch_word(true, clock.now()), Relaunch::Permitted);
+
+    assert!(fake.send_hand(42, record::Composer::Draft, true));
+    let drained = await_stream("the hand", &mut link, clock.now(), |_, link| {
+        link.status().and_then(|status| status.human_seq) == Some(42)
+    });
+    assert_eq!(
+        drained.hand,
+        Some(Hand {
+            of: 4,
+            human_seq: 42,
+            composer: record::Composer::Draft,
+            hold: true
+        })
+    );
+    let status = link.status().expect("the status");
+    assert_eq!(status.composer.as_deref(), Some("draft"));
+    assert_eq!(status.hold.as_deref(), Some("1"));
+
+    let revision = fake.revision();
+    link.reannounce(started(6262, 88, "2.1.312"), clock.now());
+    let notes = link.take_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("aterm reannounced vendor=2.1.312 child=6262:88 seq="),
+        "{notes:?}"
+    );
+    eventually("the placement", || {
+        fake.child().as_deref() == Some("6262:88")
+    });
+    let claimed = fake
+        .stream_records()
+        .into_iter()
+        .rev()
+        .find(|record| matches!(record.body, Body::Claim { .. }))
+        .expect("the claim record");
+    assert_eq!(
+        claimed.body,
+        Body::Claim {
+            child: Some(claim::ChildProcess {
+                pid: 6262,
+                start: 88
+            }),
+            scope: Some(vec![Scope::Relaunch, Scope::Upgrade]),
+            version: Some("0.2.0".to_string()),
+            vendor: Some("2.1.312".to_string()),
+            login: None,
+        }
+    );
+    assert_eq!(fake.revision(), revision + 1);
+    // aterm's `policy` after the placement: the grant is read again at its revision.
+    await_stream("the regrant", &mut link, clock.now(), |_, link| {
+        link.grant().and_then(|grant| grant.revision) == Some(revision + 1)
+    });
+    assert!(link.streaming() && link.take_notes().is_empty());
+    assert_eq!(
+        fake.verbs()
+            .iter()
+            .filter(|verb| verb.starts_with("meta set supervisor"))
+            .count(),
+        1,
+        "no claim line after the launch's"
+    );
+    link.release(clock.now());
+}
+
+/// An aterm that answers `stream` with an `ERR` keeps the v0.1 path, unnoted: the
+/// subscription's restarts, claim lines on the claim's connection. An `ERR` an aterm process
+/// gives for its life (`ERR unknown verb`) is not asked again on that connection, only on the
+/// next claim's; `ERR busy streams` is asked again on it five seconds later, and the stream
+/// opens once aterm serves it.
+#[test]
+fn a_refused_stream_keeps_the_v0_1_path_and_asks_again() {
+    let t = 7_000_000;
+    let fake = FakeAterm::for_harness("refused-stream", &config());
+    let mut link = launched(&fake, config(), child(), t);
+    assert!(link.judges() && !link.streaming());
+    assert_eq!(fake.stream_requests(), 1);
+    let notes = link.take_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("aterm claimed "), "{notes:?}");
+    assert_eq!(link.send(title(), WALL, t), Err(SendError::NoStream));
+    assert!(link.stream_fd().is_none() && link.epoch().is_none());
+
+    for pass in 1..=3 {
+        link.tick(child(), t + pass * RECLAIM_EVERY_MS);
+    }
+    assert_eq!(
+        fake.stream_requests(),
+        1,
+        "not asked again on that connection"
+    );
+    assert!(link.take_notes().is_empty());
+
+    fake.send_restart("asked");
+    let clock = Clock::new();
+    let drained = await_events("the EVENT restart", &mut link, &clock, |drained, _| {
+        drained.restart.is_some()
+    });
+    assert_eq!(
+        drained.restart.map(|restart| restart.cause).as_deref(),
+        Some("asked")
+    );
+    let claimed = fake.claim_connection().expect("the claim");
+    link.reannounce(started(5151, 78, "2.1.311"), t + RECLAIM_EVERY_MS);
+    let (id, verb) = fake.requests().pop().expect("the claim line");
+    assert!(verb.starts_with("meta set supervisor ") && verb.ends_with(" child=5151:78"));
+    assert_eq!(id, claimed);
+
+    // An aterm updated in its place ends the connection; the next claim asks again.
+    fake.serve_stream(true);
+    fake.set_stream_reply(Some("ERR busy streams"));
+    fake.restart();
+    eventually("the link lost", || {
+        let _ = link.read(t + 3 * RECLAIM_EVERY_MS);
+        link.is_lost()
+    });
+    link.tick(child(), t + 4 * RECLAIM_EVERY_MS);
+    assert!(link.judges() && !link.streaming());
+    assert_eq!(fake.stream_requests(), 2);
+    link.tick(child(), t + 5 * RECLAIM_EVERY_MS - 1);
+    assert_eq!(fake.stream_requests(), 2);
+    fake.set_stream_reply(None);
+    link.tick(child(), t + 5 * RECLAIM_EVERY_MS);
+    assert_eq!(
+        fake.stream_requests(),
+        3,
+        "busy is asked again on the same connection"
+    );
+    assert!(link.streaming());
+    assert_eq!(fake.stream_connection(), fake.claim_connection());
+    let notes = link.take_notes();
+    assert_eq!(
+        notes.last().map(String::as_str),
+        Some("aterm streaming epoch=fake-2 acked=0 in=0 resent=0"),
+        "{notes:?}"
+    );
+    link.release(t + 5 * RECLAIM_EVERY_MS);
+}
+
+/// `ERR busy streams` keeps what the stream would resend and what the caller takes: the next
+/// stream resends the records from `acked=` and passes up the kinds the caller's `session`
+/// named, with nothing given up.
+#[test]
+fn a_busy_stream_keeps_the_kept_records_and_what_the_caller_takes() {
+    let mut clock = Clock::new();
+    let (fake, mut link) = streamed_at("busy", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    use record::Kind as K;
+    assert_eq!(link.send(session(&[K::Prompt]), WALL, clock.now()), Ok(3));
+    eventually("the session applied", || fake.stream_numbers().0 >= 3);
+    fake.set_stream_deaf(true);
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(4));
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(5));
+    fake.set_stream_reply(Some("ERR busy streams"));
+    close_and_lose(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(false);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.judges() && !link.streaming());
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(6), "still kept");
+    fake.set_stream_reply(None);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.streaming());
+    eventually("the resend", || fake.stream_numbers().0 >= 6);
+    assert_eq!(
+        received(&fake)[3..6],
+        [4, 5, 6].map(|seq| (seq, "title".to_string()))
+    );
+    assert!(fake.send_record(Body::Prompt {
+        text: "go on".to_string(),
+        by: record::By::Ctl,
+    }));
+    let drained = await_stream("the prompt", &mut link, clock.now(), |drained, _| {
+        !drained.incoming.is_empty()
+    });
+    assert!(matches!(
+        drained.incoming[0].incoming,
+        Incoming::Prompt { .. }
+    ));
+    assert!(
+        link.take_notes()
+            .iter()
+            .all(|note| !note.contains("given-up")),
+        "nothing given up"
+    );
+    assert_eq!(link.counts().given_up, 0);
+    link.release(clock.now());
+}
+
+/// A claim aterm forgot when its re-exec grace ended is a new claimant in the same epoch: the
+/// link's answers of the old stream are dropped, the caller's records numbered from 1 and each
+/// move reported, and the caller told to send its `session` and `state` again.
+#[test]
+fn a_claim_forgotten_at_the_grace_end_is_a_fresh_stream_and_reports_each_new_number() {
+    let mut clock = Clock::new();
+    let fake = served("forgotten", |fake| fake.set_reexec_grace(true));
+    let mut link = launched(&fake, config(), child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(true);
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(3));
+    assert!(fake.send_record(Body::Want));
+    let drained = await_stream("the want", &mut link, clock.now(), |drained, _| {
+        !drained.incoming.is_empty()
+    });
+    assert_eq!(drained.incoming[0].of, 3);
+    assert_eq!(link.answer(3, None, clock.now()), Ok(()));
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(5));
+    close_and_lose(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(false);
+    eventually("the claim kept through the grace", || fake.in_grace());
+    fake.end_grace();
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.streaming());
+    let drained = await_stream("the new stream", &mut link, clock.now(), |_, _| {
+        fake.stream_numbers().0 >= 2 && fake.took().len() >= 4
+    });
+    assert!(drained.fresh);
+    assert_eq!(drained.renumbered, [(3, 1), (5, 2)]);
+    assert_eq!(
+        fake.took(),
+        [1, 2, 1, 2],
+        "no answer of the old stream names the new stream's records"
+    );
+    let applied: Vec<(u64, String)> = received(&fake).into_iter().skip(2).collect();
+    assert_eq!(
+        applied,
+        [
+            (1, "title".to_string()),
+            (2, "title".to_string()),
+            (3, "took".to_string()),
+            (4, "took".to_string())
+        ],
+        "the new stream's records: the caller's, then the answers to its open"
+    );
+    link.release(clock.now());
+}
+
+/// The caller's records wait for aterm's acknowledgement up to the bound; past it a record is
+/// refused, not numbered, while the link's own records still go.
+#[test]
+fn a_full_resend_queue_refuses_the_callers_record() {
+    let t = 9_000_000;
+    let (fake, mut link) = streamed_at("full", child(), t);
+    settle_open(&fake, &mut link, t);
+    fake.set_stream_deaf(true);
+    for seq in 3..3 + stream::RESEND_MAX as u64 {
+        assert_eq!(link.send(title(), WALL, t), Ok(seq));
+    }
+    assert_eq!(link.send(title(), WALL, t), Err(SendError::Full));
+    let written = link.counts().written;
+    link.tick(child(), t + BEAT_EVERY_MS);
+    assert!(link.streaming());
+    assert_eq!(link.counts().written, written + 1, "the beat went");
+    link.release(t + BEAT_EVERY_MS);
+}
+
+/// The link writes at its pace under aterm's budget of 500 at once and 50 a second, so a full
+/// queue written again on a reconnect is applied whole, never `dropped=rate`; a `claim` record
+/// aterm drops for the rate all the same is sent again, not taken as refused.
+#[test]
+fn a_full_resend_keeps_under_aterms_budget_and_a_claim_dropped_for_the_rate_is_sent_again() {
+    let mut clock = Clock::new();
+    let (fake, mut link) = streamed_at("paced", started(5151, 77, "2.1.311"), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(true);
+    for _ in 0..stream::RESEND_MAX {
+        link.send(title(), WALL, clock.now()).expect("kept");
+    }
+    close_and_lose(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(false);
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    let resent = stream::RESEND_MAX as u64 + 2;
+    eventually("the resend", || fake.stream_numbers().0 >= resent);
+    assert!(
+        fake.acks().iter().all(|(_, dropped)| dropped.is_none()),
+        "nothing dropped for the rate"
+    );
+    assert_eq!(link.counts().rate, 0);
+
+    fake.drop_next_record(Dropped::Rate);
+    link.reannounce(started(6262, 88, "2.1.312"), clock.now());
+    eventually("the placement", || {
+        link.tick(child(), clock.now());
+        fake.child().as_deref() == Some("6262:88")
+    });
+    assert!(link.streaming() && !link.is_lost());
+    assert_eq!(link.counts().rate, 1);
+    link.release(clock.now());
+}
+
+/// An aterm restart ends the stream; the new instance is a new epoch, whose `acked=` starts
+/// again, so the records the old one did not acknowledge are numbered from 1, each move is
+/// reported, and the link's answers to the old one's records are given up.
+#[test]
+fn an_aterm_restart_is_a_new_epoch_and_the_kept_records_are_numbered_from_one() {
+    let mut clock = Clock::new();
+    let (fake, mut link) = streamed_at("epoch", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    fake.set_stream_deaf(true);
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(3));
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(4));
+    fake.restart();
+    fake.set_stream_deaf(false);
+    await_stream("the restart", &mut link, clock.now(), |_, link| {
+        link.is_lost()
+    });
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    assert!(link.streaming());
+    assert_eq!(link.epoch(), Some("fake-2"));
+    let notes = link.take_notes();
+    assert_eq!(
+        notes.last().map(String::as_str),
+        Some("aterm streaming epoch=fake-2 acked=0 in=0 resent=2"),
+        "{notes:?}"
+    );
+    eventually("the resend", || fake.stream_numbers().0 >= 2);
+    assert_eq!(
+        fake.stream_records()
+            .into_iter()
+            .filter(|record| record.body == title())
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        [1, 2],
+        "the old epoch never applied 3 and 4"
+    );
+    // The new epoch's records are heard from 1 again.
+    let drained = await_stream("the new epoch's records", &mut link, clock.now(), |_, _| {
+        fake.took().iter().filter(|seq| **seq <= 2).count() == 4
+    });
+    assert!(drained.fresh);
+    assert_eq!(drained.renumbered, [(3, 1), (4, 2)]);
+    link.release(clock.now());
+}
+
+/// Each `dropped=` reason is counted and noted once a stream; a `claim` record aterm refuses
+/// loses the link, as a refused claim line does.
+#[test]
+fn a_dropped_record_is_counted_and_noted_once_and_a_dropped_claim_loses_the_link() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("dropped", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    link.take_notes();
+    let wall = || Body::Wall {
+        kind: "usage-session".to_string(),
+        resets_ms: None,
+    };
+    assert_eq!(link.send(wall(), WALL, clock.now()), Ok(3));
+    assert_eq!(link.send(wall(), WALL, clock.now()), Ok(4));
+    eventually("the walls", || fake.acks().len() == 4);
+    fake.drop_next_record(Dropped::Rate);
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(5));
+    await_stream("the drops", &mut link, clock.now(), |_, link| {
+        link.counts().acks == 5
+    });
+    let counts = link.counts();
+    assert_eq!((counts.scope, counts.rate), (2, 1));
+    assert_eq!(
+        link.take_notes(),
+        [
+            "aterm stream-dropped seq=3 k=wall dropped=scope",
+            "aterm stream-dropped seq=5 k=title dropped=rate"
+        ]
+    );
+    assert!(link.streaming());
+
+    fake.set_claim_reply("ERR busy supervisor=other@9");
+    link.reannounce(started(5151, 79, "2.1.311"), clock.now());
+    await_stream("the refused claim", &mut link, clock.now(), |_, link| {
+        link.is_lost()
+    });
+    let notes = link.take_notes();
+    assert_eq!(
+        notes.last().map(String::as_str),
+        Some("aterm lost reannounce dropped=refused:busy"),
+        "{notes:?}"
+    );
+}
+
+/// A contract-3 claim never asks for the stream, and neither does a config that does not
+/// stream: the v0.1 path is all there is.
+#[test]
+fn a_contract_3_claim_or_a_config_without_the_stream_never_asks_for_it() {
+    let t = 11_000_000;
+    let fake = served("three", |fake| fake.serve_contracts(&[2, 3]));
+    let mut link = launched(&fake, config(), child(), t);
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Three)
+    );
+    for pass in 1..=3 {
+        link.tick(child(), t + pass * RECLAIM_EVERY_MS);
+    }
+    assert_eq!(fake.stream_requests(), 0);
+    assert!(!link.streaming());
+    assert_eq!(link.send(title(), WALL, t), Err(SendError::NoStream));
+    link.release(t + 4 * RECLAIM_EVERY_MS);
+
+    let fake = served("no-stream", |_| {});
+    let mut link = launched(&fake, config().with_stream(false), child(), t);
+    assert_eq!(
+        link.grant().map(|grant| grant.contract),
+        Some(Contract::Four)
+    );
+    for pass in 1..=3 {
+        link.tick(child(), t + pass * RECLAIM_EVERY_MS);
+    }
+    assert_eq!(fake.stream_requests(), 0);
+    assert!(link.judges() && !link.streaming());
+    assert_eq!(link.send(title(), WALL, t), Err(SendError::NoStream));
+    link.release(t + 4 * RECLAIM_EVERY_MS);
+}
+
+/// Against an aterm that opens streams and sends no record of its own (HX-15b1 without
+/// HX-15c), the subscription's restart and policy events are still heard; and an `EVENT
+/// restart` aterm sent before the stream opened is not lost to the open.
+#[test]
+fn events_are_heard_until_the_stream_brings_one_of_aterms_records() {
+    let clock = Clock::new();
+    let fake = served("b1-alone", |fake| fake.set_stream_own_records(false));
+    let mut link = launched(&fake, config(), child(), clock.now());
+    assert!(link.streaming());
+    fake.send_restart("asked");
+    let drained = await_events("the EVENT restart", &mut link, &clock, |drained, _| {
+        drained.restart.is_some()
+    });
+    assert_eq!(
+        drained.restart.map(|restart| restart.cause).as_deref(),
+        Some("asked")
+    );
+    let before = fake.requests().len();
+    fake.set_cap(Some(&[Scope::Upgrade]));
+    await_events("the EVENT harness-policy", &mut link, &clock, |_, link| {
+        !link.takes(Scope::Relaunch)
+    });
+    assert!(fake.requests().len() > before, "the policy was read");
+    link.release(clock.now());
+
+    let t = 12_000_000;
+    let fake = served("event-before-open", |fake| {
+        fake.set_stream_reply(Some("ERR busy streams"));
+    });
+    let mut link = launched(&fake, config(), child(), t);
+    assert!(!link.streaming());
+    fake.send_restart("asked");
+    let fd = link.event_fd().expect("the subscription");
+    let mut probe = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: probe is one initialized poll record for the link's open descriptor.
+    let ready = unsafe { libc::poll(&raw mut probe, 1, 5_000) };
+    assert_eq!(ready, 1, "the event arrived");
+    fake.set_stream_reply(None);
+    link.tick(child(), t + RECLAIM_EVERY_MS);
+    assert!(link.streaming());
+    let drained = await_stream(
+        "the open's records",
+        &mut link,
+        t + RECLAIM_EVERY_MS,
+        |_, link| link.counts().acks >= 2,
+    );
+    assert_eq!(
+        drained.restart.map(|restart| restart.cause).as_deref(),
+        Some("asked"),
+        "the restart sent before the open"
+    );
+    link.release(t + RECLAIM_EVERY_MS);
+}
+
+/// An `OK` to `stream` that does not read (here one naming a count past [`stream::SEQ_MAX`])
+/// loses the link once and ends the stream for its life: the claim is made again and kept on
+/// the v0.1 path, never asked for the stream again, so it does not churn.
+#[test]
+fn an_ok_that_does_not_read_ends_the_stream_for_the_links_life() {
+    let t = 13_000_000;
+    let fake = served("bad-ok", |fake| {
+        fake.set_stream_reply(Some(
+            "OK stream v=1 epoch=x acked=18446744073709551615 in=0",
+        ));
+    });
+    let mut link = launched(&fake, config(), child(), t);
+    assert!(link.is_lost());
+    let notes = link.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("aterm stream-off ")),
+        "{notes:?}"
+    );
+    for pass in 1..=3 {
+        link.tick(child(), t + pass * RECLAIM_EVERY_MS);
+    }
+    assert!(link.judges() && !link.streaming());
+    assert_eq!(fake.stream_requests(), 1);
+    link.release(t + 4 * RECLAIM_EVERY_MS);
+}
+
+/// Numbers past [`stream::SEQ_MAX`] from aterm, or an acknowledgement of a record never
+/// written, lose the stream; nothing panics or wraps, and the claim is made again.
+#[test]
+fn protocol_faults_from_aterm_lose_the_stream_and_never_wrap() {
+    let mut clock = Clock::new();
+    let (fake, mut link) = streamed_at("faults", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    for line in [
+        r#"{"k":"ack","seq":18446744073709551615,"ms":0}"#,
+        r#"{"k":"want","seq":18446744073709551615,"ms":0}"#,
+        r#"{"k":"ack","seq":40,"ms":0}"#,
+    ] {
+        link.take_notes();
+        assert!(fake.send_line(line));
+        await_stream(line, &mut link, clock.now(), |_, link| link.is_lost());
+        let notes = link.take_notes();
+        assert!(notes[0].starts_with("aterm lost stream "), "{notes:?}");
+        clock.pass(RECLAIM_EVERY_MS);
+        link.tick(child(), clock.now());
+        assert!(link.streaming());
+    }
+    assert!(fake.send_line(r#"{"k":"want","seq":9223372036854775807,"ms":0}"#));
+    assert!(fake.send_line("not json"));
+    let drained = await_stream("the last want", &mut link, clock.now(), |_, link| {
+        link.counts().unreadable == 1
+    });
+    assert_eq!(drained.incoming[0].of, stream::SEQ_MAX);
+    assert!(link.streaming());
+    link.release(clock.now());
+}
+
+/// A line that does not read is refused when its `seq` can be found, but an `ack` that does not
+/// read moves no number: aterm's next record is still heard and answered.
+#[test]
+fn an_unreadable_ack_moves_no_number_and_the_next_record_is_answered() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("unreadable", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    assert!(fake.send_line(r#"{"k":"ack","seq":"3","ms":0}"#));
+    assert!(fake.send_record(Body::Want));
+    assert!(fake.send_line(r#"{"k":"want","seq":4,"ms":"x"}"#));
+    let drained = await_stream("the want", &mut link, clock.now(), |_, link| {
+        link.counts().unreadable == 2
+    });
+    assert_eq!(drained.incoming.len(), 1);
+    assert_eq!(drained.incoming[0].of, 3);
+    assert_eq!(link.counts().repeated, 0);
+    eventually("the refusal", || !fake.refused().is_empty());
+    assert_eq!(fake.refused()[0].0, 4);
+    link.release(clock.now());
+}
+
+/// Only a record that can end a hold (`hand`, `policy`, `restart`) has `status` read again: the
+/// acknowledgements of the harness's own records do not.
+#[test]
+fn acknowledgements_do_not_end_a_hold() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("hold", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    fake.set_status("hold", Some("1"));
+    assert!(matches!(
+        link.safe_point(Duration::ZERO, clock.now()),
+        Verdict::Hold(_)
+    ));
+    assert!(link.held_back(clock.now()));
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(3));
+    await_stream("the ack", &mut link, clock.now(), |_, link| {
+        link.counts().acks >= 3
+    });
+    link.tick(child(), clock.now());
+    assert!(link.held_back(clock.now()));
+    assert!(fake.send_hand(9, record::Composer::Empty, false));
+    await_stream("the hand", &mut link, clock.now(), |drained, _| {
+        drained.hand.is_some()
+    });
+    assert!(!link.held_back(clock.now()));
+    link.release(clock.now());
+}
+
+/// The link's own records past [`stream::OWN_MAX`] unacknowledged lose the stream: aterm sends
+/// records and acknowledges none of the answers.
+#[test]
+fn own_records_past_their_bound_lose_the_stream() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("own-bound", child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    link.take_notes();
+    fake.set_stream_deaf(true);
+    for _ in 0..=stream::OWN_MAX {
+        assert!(fake.send_record(Body::Interrupt));
+    }
+    await_stream("the loss", &mut link, clock.now(), |_, link| link.is_lost());
+    assert_eq!(
+        link.take_notes(),
+        [format!("aterm lost stream own-queue={}", stream::OWN_MAX)]
+    );
+}
+
+/// `request` sends a session-addressed request on the held request connection, the second one
+/// while a stream is open, and refuses the requests that are the link's own.
+#[test]
+fn request_goes_on_the_second_connection_and_refuses_the_links_own_verbs() {
+    let clock = Clock::new();
+    let (fake, mut link) = streamed_at("request", child(), clock.now());
+    let stream = fake.stream_connection().expect("the stream");
+    assert_eq!(
+        link.request("meta set harness_act word=x", clock.now()),
+        Ok("ERR unknown verb".to_string())
+    );
+    let (id, verb) = fake.requests().pop().expect("the request");
+    assert_eq!(verb, "meta set harness_act word=x");
+    assert_ne!(id, stream);
+    let before = fake.requests().len();
+    for verb in [
+        "meta set supervisor x@1 contract=4",
+        "meta  unset supervisor",
+        "stream @s v=1",
+        "subscribe @s events",
+        "@s status",
+        "status\nstatus",
+        "",
+    ] {
+        assert!(
+            matches!(link.request(verb, clock.now()), Err(Failure::Refused(_))),
+            "{verb:?}"
+        );
+    }
+    assert_eq!(fake.requests().len(), before);
+    assert!(link.streaming());
+    link.release(clock.now());
+}
+
+/// Each stream's rate budget is full at its open, as aterm's is a stream's (D10).
+#[test]
+fn each_stream_opens_with_a_full_rate_budget() {
+    let mut clock = Clock::new();
+    let fake = served("budget", |fake| fake.set_stream_rate(3, 0));
+    let mut link = launched(&fake, config(), child(), clock.now());
+    settle_open(&fake, &mut link, clock.now());
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(3));
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(4));
+    await_stream("the drop", &mut link, clock.now(), |_, link| {
+        link.counts().acks >= 4
+    });
+    assert_eq!(link.counts().rate, 1);
+    close_and_lose(&fake, &mut link, clock.now());
+    clock.pass(RECLAIM_EVERY_MS);
+    link.tick(child(), clock.now());
+    await_stream("the new open", &mut link, clock.now(), |_, link| {
+        link.counts().acks >= 6
+    });
+    // The open's answers are 5 and 6, and fit the new budget with this record.
+    assert_eq!(link.send(title(), WALL, clock.now()), Ok(7));
+    await_stream("the title", &mut link, clock.now(), |_, link| {
+        link.counts().acks >= 7
+    });
+    assert_eq!(link.counts().rate, 1, "the new stream had its budget");
+    link.release(clock.now());
 }

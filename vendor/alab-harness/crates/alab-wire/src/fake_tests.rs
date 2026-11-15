@@ -6,6 +6,7 @@
 //! harness scenario that fails later is the harness's failure and not a
 //! disagreement between the fake and this crate.
 
+use std::io::BufReader;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -15,6 +16,7 @@ use crate::claim::{
     self, Child, ChildProcess, Contract, Grant, Hold, Human, Policy, ReplyError, SafePoint, Scope,
     Status, judge_safe_point,
 };
+use crate::record::{Body, Dropped, RATE_BURST, RATE_PER_S, Record, StreamReply};
 use crate::wire::{Connection, EventReader, EventUpdate, Fields};
 
 /// How long a self-test waits for the fake's threads before it fails.
@@ -169,13 +171,17 @@ fn the_fake_aterms_policy_reads_as_a_policy() {
     let mut connection = connect(&fake);
     let on = policy(&fake, &mut connection);
     assert_eq!(on.generation, 1);
-    assert!(on.admits_claim() && on.relaunch && on.upgrade && !on.upgrade_ask);
+    assert!(
+        on.admits_claim(&Config::DEFAULT_CONTRACTS) && on.relaunch && on.upgrade && !on.upgrade_ask
+    );
     assert_eq!(on.human_grace, Duration::from_secs(120));
 
     fake.set_policy(&POLICY_ON.replace("effective=on why=enabled", "effective=off why=hold"));
     let off = policy(&fake, &mut connection);
     assert_eq!(off.generation, 2);
-    assert!(off.serves_contract() && !off.effective && !off.admits_claim());
+    assert!(
+        off.serves_contract() && !off.effective && !off.admits_claim(&Config::DEFAULT_CONTRACTS)
+    );
 
     // A halt is the policy off, `why=hold`, at the same generation.
     fake.set_policy(POLICY_ON);
@@ -191,7 +197,10 @@ fn the_fake_aterms_policy_reads_as_a_policy() {
     fake.set_policy_reply("OK gen=12 effective=on why=config continue=on land=off questions=on");
     let older = ask(&mut connection, claim::policy_verb(&fake.sid));
     assert_eq!(Policy::parse(&older), Err(ReplyError::Missing("contract")));
-    assert_eq!(claim::advertised_contract(&older), None);
+    assert_eq!(
+        claim::advertised_contract(&older, &Config::DEFAULT_CONTRACTS),
+        None
+    );
     fake.set_policy_reply("ERR denied");
     let denied = ask(&mut connection, claim::policy_verb(&fake.sid));
     assert_eq!(
@@ -868,11 +877,17 @@ fn the_fake_serves_contracts_3_and_4_and_can_serve_3_alone() {
     let mut connection = connect(&fake);
     let served = policy(&fake, &mut connection);
     assert_eq!(served.contracts, [2, 3, 4]);
-    assert_eq!(served.contract(), Some(Contract::Four));
+    assert_eq!(
+        served.contract(&Config::DEFAULT_CONTRACTS),
+        Some(Contract::Four)
+    );
     fake.serve_contracts(&[3]);
     let three = policy(&fake, &mut connection);
     assert_eq!(three.contracts, [3]);
-    assert_eq!(three.contract(), Some(Contract::Three));
+    assert_eq!(
+        three.contract(&Config::DEFAULT_CONTRACTS),
+        Some(Contract::Three)
+    );
     assert!(three.generation > served.generation);
     assert!(
         claim_at(
@@ -888,7 +903,7 @@ fn the_fake_serves_contracts_3_and_4_and_can_serve_3_alone() {
     assert_eq!(claim(&fake, &mut connection, &[Scope::Relaunch]), "OK");
     fake.serve_contracts(&[2, 3, 4]);
     assert_eq!(
-        policy(&fake, &mut connection).contract(),
+        policy(&fake, &mut connection).contract(&Config::DEFAULT_CONTRACTS),
         Some(Contract::Four)
     );
 }
@@ -1071,4 +1086,323 @@ fn a_cap_narrows_a_live_contract_4_claim_raises_its_revision_and_says_so() {
     let restored = status(&fake, &mut connection);
     assert_eq!(restored.supervisor_scope, ["relaunch", "upgrade"]);
     assert_eq!(restored.supervisor_revision, Some(6));
+}
+
+// ─────────────────────────────── the session stream ───────────────────────────────
+
+/// A connection driven by hand, as aterm's own stream reader sees one: authenticated, then
+/// requests and records written and read a line at a time.
+struct Raw {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
+
+impl Raw {
+    fn open(fake: &FakeAterm) -> Self {
+        let socket = fake.locator().socket().expect("the graph names the socket");
+        let writer = UnixStream::connect(socket).expect("connect");
+        writer.set_read_timeout(Some(HANG)).expect("a read bound");
+        writer.set_write_timeout(Some(HANG)).expect("a write bound");
+        let mut raw = Self {
+            reader: BufReader::new(writer.try_clone().expect("a reader")),
+            writer,
+        };
+        raw.send(&format!("AUTH {TOKEN}"));
+        assert_eq!(raw.ask("version"), "OK version=fake-aterm");
+        raw
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write as _;
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write a line");
+    }
+
+    /// One line read, without its newline; empty at the end of the stream.
+    fn line(&mut self) -> String {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("read a line");
+        line.trim_end_matches('\n').to_string()
+    }
+
+    fn ask(&mut self, line: &str) -> String {
+        self.send(line);
+        self.line()
+    }
+
+    fn record(&mut self) -> Record {
+        Record::read(self.line().as_bytes())
+            .expect("a record")
+            .record
+    }
+
+    fn put(&mut self, seq: u64, body: Body) {
+        let line = Record { seq, ms: 1, body }.line().expect("a line");
+        self.send(&line);
+    }
+
+    /// The acknowledgement of the next record read: its `seq` and `dropped=`.
+    fn ack(&mut self) -> (u64, Option<Dropped>) {
+        match self.record() {
+            Record {
+                seq,
+                body: Body::Ack { dropped },
+                ..
+            } => (seq, dropped),
+            other => panic!("an ack, not {other:?}"),
+        }
+    }
+}
+
+/// A contract-4 claim of `scopes` on `raw` by this process, naming `child`.
+fn claim_raw(fake: &FakeAterm, raw: &mut Raw, scopes: &[Scope], child: &str) -> String {
+    let (_, holder) = me();
+    let words = claim::scope_words(scopes);
+    raw.ask(&format!(
+        "@{} meta set supervisor {holder} contract=4 scope={words} version=0.1.0 \
+         vendor=2.1.311 child={child}",
+        fake.sid
+    ))
+}
+
+const STREAMED: [Scope; 3] = [Scope::Relaunch, Scope::Upgrade, Scope::State];
+
+/// A served stream on a fresh contract-4 claim, its `OK` read and the `hand` and `policy`
+/// records every open sends.
+fn open_raw(fake: &FakeAterm) -> (Raw, StreamReply) {
+    let mut raw = Raw::open(fake);
+    assert!(claim_raw(fake, &mut raw, &STREAMED, "5151:7").starts_with("OK scope="));
+    let reply = StreamReply::parse(&raw.ask(&format!("stream @{} v=1", fake.sid)))
+        .expect("the stream's OK");
+    assert!(matches!(raw.record().body, Body::Hand { .. }));
+    assert_eq!(raw.record().body, Body::Policy);
+    (raw, reply)
+}
+
+/// Until it is served, `stream` is an unknown verb and the connection stays in request mode
+/// with its claim; served, it opens only on the connection that holds a contract-4 claim.
+#[test]
+fn the_fake_streams_only_a_contract_4_claims_own_connection_and_only_when_served() {
+    let fake = root("stream-open");
+    let stream = format!("stream @{} v=1", fake.sid);
+    let mut raw = Raw::open(&fake);
+    assert!(claim_raw(&fake, &mut raw, &STREAMED, "5151:7").starts_with("OK "));
+    assert_eq!(raw.ask(&stream), STREAM_UNKNOWN);
+    fake.set_stream_reply(Some("ERR busy streams"));
+    assert_eq!(raw.ask(&stream), "ERR busy streams");
+    // The claim and the request mode stand.
+    assert!(
+        raw.ask(&format!("@{} status", fake.sid))
+            .contains(&format!(" supervisor={} ", me().1))
+    );
+    fake.set_stream_reply(None);
+    fake.serve_stream(true);
+    let mut other = Raw::open(&fake);
+    assert!(
+        other
+            .ask(&stream)
+            .starts_with("ERR usage: stream: no contract 4 claim")
+    );
+    assert!(
+        raw.ask("stream @s-ffff v=1")
+            .starts_with("ERR usage: stream @<sid> v=1")
+    );
+    // A contract-3 claim opens none.
+    let mut three = Raw::open(&fake);
+    raw.ask(&format!("@{} meta unset supervisor", fake.sid));
+    assert_eq!(
+        three.ask(&format!(
+            "@{} meta set supervisor {} contract=3 scope=relaunch version=0.1.0",
+            fake.sid,
+            me().1
+        )),
+        "OK"
+    );
+    assert!(
+        three
+            .ask(&stream)
+            .starts_with("ERR usage: stream: no contract 4 claim")
+    );
+    drop(three);
+    eventually("the contract-3 claim to go", || fake.holder().is_none());
+    assert_eq!(fake.stream_requests(), 5);
+    assert!(fake.streams_opened().is_empty());
+
+    let (_raw, reply) = open_raw(&fake);
+    assert_eq!(
+        reply,
+        StreamReply {
+            epoch: "fake-1".to_string(),
+            acked: 0,
+            sent: 0,
+        }
+    );
+    assert_eq!(
+        fake.streams_opened(),
+        [fake.claim_connection().expect("a claim")]
+    );
+    assert_eq!(fake.stream_connection(), fake.claim_connection());
+    assert_eq!(fake.stream_numbers(), (0, 2));
+}
+
+/// Each harness record is acknowledged in order by the plan's D8 and D10: applied, at or
+/// below `acked`, over the bound, over the budget, outside the grant, a claim placement
+/// refused; `took` and `refused` are kept; a gap closes the stream.
+#[test]
+fn the_fake_acknowledges_each_record_by_the_dropped_rules() {
+    let fake = root("stream-acks");
+    fake.serve_stream(true);
+    let (mut raw, _) = open_raw(&fake);
+    let state = || Body::State {
+        state: crate::record::State::Idle,
+        composer: None,
+    };
+    raw.put(1, state());
+    assert_eq!(raw.ack(), (1, None));
+    raw.put(1, state());
+    assert_eq!(raw.ack(), (1, Some(Dropped::Applied)));
+    // `walls` was not claimed.
+    raw.put(
+        2,
+        Body::Wall {
+            kind: "usage-session".to_string(),
+            resets_ms: None,
+        },
+    );
+    assert_eq!(raw.ack(), (2, Some(Dropped::Scope)));
+    // A line over the bound is the next record, unparsed.
+    raw.send(&"x".repeat(crate::record::LINE_MAX + 1));
+    assert_eq!(raw.ack(), (3, Some(Dropped::Bound)));
+    fake.set_stream_rate(0, 0);
+    raw.put(4, Body::Beat);
+    assert_eq!(raw.ack(), (4, Some(Dropped::Rate)));
+    fake.set_stream_rate(RATE_BURST, RATE_PER_S);
+    fake.drop_next_record(Dropped::Other("staged".to_string()));
+    raw.put(5, Body::Beat);
+    assert_eq!(raw.ack(), (5, Some(Dropped::Other("staged".to_string()))));
+    raw.put(6, Body::Took { of: 1 });
+    assert_eq!(raw.ack(), (6, None));
+    raw.put(
+        7,
+        Body::Refused {
+            of: 2,
+            why: "not taken".to_string(),
+        },
+    );
+    assert_eq!(raw.ack(), (7, None));
+    assert_eq!(fake.took(), [1]);
+    assert_eq!(fake.refused(), [(2, "not taken".to_string())]);
+    // A claim record is a claim placement: its words, the standing claim's for the rest.
+    let revision = fake.revision();
+    raw.put(
+        8,
+        Body::Claim {
+            child: Some(ChildProcess {
+                pid: 6262,
+                start: 9,
+            }),
+            scope: None,
+            version: None,
+            vendor: Some("2.1.312".to_string()),
+            login: None,
+        },
+    );
+    assert_eq!(raw.ack(), (8, None));
+    assert_eq!(raw.record().body, Body::Policy);
+    let words = fake.claim_words().expect("the claim stands");
+    assert_eq!(words.child.as_deref(), Some("6262:9"));
+    assert_eq!(words.vendor.as_deref(), Some("2.1.312"));
+    assert_eq!(words.scope.as_deref(), Some("relaunch,upgrade,state"));
+    assert_eq!(fake.revision(), revision + 1);
+    // One aterm refuses is acknowledged with the refusal's word, and the claim stands.
+    raw.put(
+        9,
+        Body::Claim {
+            child: None,
+            scope: Some(Vec::new()),
+            version: None,
+            vendor: None,
+            login: None,
+        },
+    );
+    assert_eq!(raw.ack(), (9, Some(Dropped::Refused("usage".to_string()))));
+    assert_eq!(fake.child().as_deref(), Some("6262:9"));
+    assert_eq!(
+        fake.acks().len(),
+        10,
+        "every record was acknowledged once, the resend included"
+    );
+    // A gap closes the stream, and the claim bound to its connection goes with it.
+    raw.put(11, Body::Beat);
+    assert_eq!(raw.line(), "", "the stream ended");
+    eventually("the stream to close", || !fake.streaming());
+    eventually("the claim to go", || fake.holder().is_none());
+    assert_eq!(fake.beats(), 2);
+    assert_eq!(fake.stream_numbers().0, 9);
+}
+
+/// The fake's own records reach an open stream (a policy move, a restart, a hand, any body),
+/// the claimant's `acked` and `in` outlive a closed stream, and an aterm restart is a new
+/// epoch that knows neither.
+#[test]
+fn the_fake_sends_its_records_and_keeps_the_claimants_numbers_across_a_reconnect() {
+    let fake = root("stream-records");
+    fake.serve_stream(true);
+    let (mut raw, _) = open_raw(&fake);
+    fake.set_policy(POLICY_ON);
+    let policy = raw.record();
+    assert_eq!((policy.seq, policy.body), (3, Body::Policy));
+    fake.send_model_restart("model", "opus[1m]");
+    assert!(matches!(
+        raw.record().body,
+        Body::Restart { ref cause, ref model, .. }
+            if cause == "model" && model.as_deref() == Some("opus[1m]")
+    ));
+    assert!(fake.send_hand(17, crate::record::Composer::Draft, true));
+    assert_eq!(
+        raw.record().body,
+        Body::Hand {
+            human_seq: 17,
+            composer: crate::record::Composer::Draft,
+            hold: true,
+        }
+    );
+    assert!(fake.send_record(Body::Want));
+    assert_eq!(raw.record().body, Body::Want);
+    raw.put(1, Body::Beat);
+    assert_eq!(raw.ack(), (1, None));
+    assert_eq!(fake.stream_numbers(), (1, 6));
+
+    fake.close_stream();
+    assert_eq!(raw.line(), "");
+    eventually("the claim to go", || fake.holder().is_none());
+    assert!(!fake.send_record(Body::Want), "no stream is open");
+    let (mut again, reply) = open_raw(&fake);
+    assert_eq!(
+        reply,
+        StreamReply {
+            epoch: "fake-1".to_string(),
+            acked: 1,
+            sent: 6,
+        }
+    );
+    // The open sent the hand it holds.
+    again.put(2, Body::Beat);
+    assert_eq!(again.ack(), (2, None));
+    assert_eq!(fake.streams_opened().len(), 2);
+
+    fake.restart();
+    assert_eq!(again.line(), "");
+    let (_raw, reply) = open_raw(&fake);
+    assert_eq!(
+        reply,
+        StreamReply {
+            epoch: "fake-2".to_string(),
+            acked: 0,
+            sent: 0,
+        }
+    );
+    assert_eq!(fake.epoch(), "fake-2");
 }

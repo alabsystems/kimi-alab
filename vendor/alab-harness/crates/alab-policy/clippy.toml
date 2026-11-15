@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# alab-policy's disallowed methods and types. Clippy reads only the nearest clippy.toml, so this
+# file holds every row that binds this crate.
+#
+# * Rows from aterm: every std and core row of aterm's clippy.toml, word for word, so the code
+#   moved out of aterm's supervisor loses no lint it had there. Their reasons name aterm's own
+#   doors (aterm_uds, aterm_durable, ...), which this crate cannot reach: it has no dependencies,
+#   so here each row simply refuses.
+# * No input or output: aterm's census stops seeing this code once it sits under aterm's
+#   vendor/, so the crate enforces the rule itself. Clippy takes no module wildcard, so each std
+#   module the rule closes is listed whole: every free function of std::fs and std::process,
+#   std::env's var readers, and every type of std::fs, std::process and std::net; plus the clocks
+#   (Instant::now, SystemTime::now) and sleep. A caller passes a reading or a time as data.
+#   The rest of what aterm's census (its supervise-fx rule) refused in these files is listed too,
+#   so the move loses none of it: the clock read by .elapsed() and the sleeps sleep_until and
+#   park_timeout; a delivery from another thread waited on by try_recv or recv_timeout; and the
+#   disk reached through a std::path::Path method (exists, metadata, read_dir and the like). So
+#   is the rest of std::env that reads or changes the process (args, the current, home and temp
+#   directories, the executable's path); set_var and remove_var are unsafe in edition 2024, which
+#   forbid(unsafe_code) already refuses, and split_paths, join_paths and consts only compute.
+#   std::process's ExitCode and Termination stay open: they only say how a main ends, and the
+#   test harness's generated main names ExitCode, so its ban refuses every test target.
+#   lib.rs adds #![forbid(unsafe_code)].
+disallowed-methods = [
+  # Rows from aterm, word for word.
+  { path = "std::net::TcpListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
+  { path = "std::net::TcpListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
+  { path = "std::os::unix::net::UnixListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },
+  { path = "std::os::unix::net::UnixListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },
+  { path = "std::io::pipe", reason = "make a pipe with aterm_uds::pipe, which keeps both ends out of every child it is not handed to (clippy.toml: kept-out pipes)" },
+  { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "core::option::Option::map_or_default", reason = "spell it .map(..).unwrap_or_default(): it is unstable on the stable Rust the foreign cells build with (clippy.toml: stable spellings)" },
+  { path = "core::result::Result::map_or_default", reason = "spell it .map(..).unwrap_or_default(): it is unstable on the stable Rust the foreign cells build with (clippy.toml: stable spellings)" },
+  { path = "std::thread::yield_now", reason = "wait on a wake: a Condvar, a channel, pause_for_handover or a bounded sleep slice; a test's poll pauses with aterm_uds::deadline::poll_yield (clippy.toml: a wait that wakes)" },
+  { path = "std::thread::available_parallelism", reason = "size a pool with aterm_cores::available_parallelism, bounded by the cores verify grants a test (clippy.toml: a granted pool)" },
+  # No input or output.
+  { path = "std::fs::canonicalize", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::copy", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::create_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::create_dir_all", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::exists", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::hard_link", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::metadata", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::read", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::read_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::read_link", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::read_to_string", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::remove_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::remove_dir_all", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::remove_file", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::rename", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::set_permissions", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::soft_link", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::symlink_metadata", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::write", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::exit", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::id", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::var", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::var_os", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::vars", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::vars_os", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::time::Instant::now", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::time::SystemTime::now", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::thread::sleep", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::thread::sleep_ms", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::time::Instant::elapsed", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::time::SystemTime::elapsed", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::thread::sleep_until", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::thread::park_timeout", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::thread::park_timeout_ms", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::sync::mpsc::Receiver::try_recv", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::exists", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::try_exists", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::is_file", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::is_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::is_symlink", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::metadata", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::symlink_metadata", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::read_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::read_link", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::path::Path::canonicalize", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::args", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::args_os", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::current_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::set_current_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::current_exe", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::home_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::env::temp_dir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+]
+disallowed-types = [
+  # Rows from aterm, word for word.
+  { path = "std::process::Command", reason = "build children with aterm_uds::spawnfd::command, which hands them stdio and nothing else (clippy.toml: one child constructor)" },
+  # No input or output.
+  { path = "std::fs::DirBuilder", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::DirEntry", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::File", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::FileTimes", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::FileType", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::Metadata", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::OpenOptions", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::Permissions", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::ReadDir", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::fs::TryLockError", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::Child", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::ChildStderr", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::ChildStdin", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::ChildStdout", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::CommandArgs", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::CommandEnvs", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::ExitStatus", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::Output", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::process::Stdio", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::AddrParseError", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::Incoming", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::IpAddr", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::Ipv4Addr", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::Ipv6Addr", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::Shutdown", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::SocketAddr", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::SocketAddrV4", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::SocketAddrV6", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::TcpListener", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::TcpStream", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::ToSocketAddrs", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+  { path = "std::net::UdpSocket", reason = "alab-policy does no input or output: a decider reads only the data its caller hands it (clippy.toml: no input or output)" },
+]
