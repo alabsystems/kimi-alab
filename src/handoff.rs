@@ -19,9 +19,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustix::io::{FdFlags, fcntl_setfd};
 use serde_json::{Map, Value};
 
-use crate::aterm::Account;
 use crate::proc::{Birth, ChildIdentity, Executable};
 use crate::store::Build;
+use alab_wire::Account;
 
 /// The descriptor whose bytes describe the running child to the next harness image.
 pub const FD_ENV: &str = "KIMI_ALAB_EXEC_FD";
@@ -42,8 +42,10 @@ pub struct State {
     pub account: Option<Account>,
     /// How long the child has run.
     pub started_for: Duration,
-    /// Whether its one immediate crash relaunch has been spent.
-    pub crash_relaunched: bool,
+    /// The crash back-off's streak: relaunches of a crash not yet forgiven.
+    pub crash_streak: u32,
+    /// How long ago the last crash relaunch was made, if one was.
+    pub crash_since: Option<Duration>,
     /// Vendor builds already found unable to start the session.
     pub abandoned: BTreeSet<u64>,
     /// Kernel proof of the live child. Absent only in a legacy schema-1 handoff; new execs require it.
@@ -181,9 +183,17 @@ fn encode(state: &State) -> Result<Vec<u8>, String> {
         "started_ms".to_string(),
         Value::from(u64::try_from(state.started_for.as_millis()).unwrap_or(u64::MAX)),
     );
+    root.insert("crash_streak".to_string(), Value::from(state.crash_streak));
+    root.insert(
+        "crash_since_ms".to_string(),
+        state.crash_since.map_or(Value::Null, |since| {
+            Value::from(u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        }),
+    );
+    // A 0.2 image reads only this; written so a rollback can still adopt the child.
     root.insert(
         "crash_relaunched".to_string(),
-        Value::from(state.crash_relaunched),
+        Value::from(state.crash_streak > 0),
     );
     root.insert(
         "abandoned".to_string(),
@@ -359,10 +369,7 @@ fn decode(text: &str) -> Result<State, String> {
         .get("started_ms")
         .and_then(Value::as_u64)
         .ok_or("the handoff has no child age")?;
-    let crash_relaunched = root
-        .get("crash_relaunched")
-        .and_then(Value::as_bool)
-        .ok_or("the handoff has no crash history")?;
+    let (crash_streak, crash_since) = decode_crash(root, started_ms)?;
     let abandoned = root
         .get("abandoned")
         .and_then(Value::as_array)
@@ -377,10 +384,42 @@ fn decode(text: &str) -> Result<State, String> {
         session: optional_string(root.get("session"))?,
         account,
         started_for: Duration::from_millis(started_ms),
-        crash_relaunched,
+        crash_streak,
+        crash_since,
         abandoned,
         identity,
     })
+}
+
+/// The crash ladder a handoff carries: `crash_streak` and `crash_since_ms`, or a 0.2 image's
+/// `crash_relaunched`, read as one relaunch spent when its child (`started_ms` ago) started.
+fn decode_crash(
+    root: &serde_json::Map<String, Value>,
+    started_ms: u64,
+) -> Result<(u32, Option<Duration>), String> {
+    match root.get("crash_streak") {
+        Some(streak) => {
+            let streak = streak
+                .as_u64()
+                .and_then(|streak| u32::try_from(streak).ok())
+                .ok_or("the handoff's crash streak is not a count")?;
+            let since = match root.get("crash_since_ms") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(Duration::from_millis(
+                    value
+                        .as_u64()
+                        .ok_or("the handoff's crash age is not a duration")?,
+                )),
+            };
+            Ok((streak, since))
+        }
+        // A 0.2 image's handoff: one immediate relaunch spent, made when its child started.
+        None => match root.get("crash_relaunched").and_then(Value::as_bool) {
+            Some(true) => Ok((1, Some(Duration::from_millis(started_ms)))),
+            Some(false) => Ok((0, None)),
+            None => Err("the handoff has no crash history".to_string()),
+        },
+    }
 }
 
 fn transport(encoded: &[u8]) -> Result<File, String> {
@@ -529,7 +568,8 @@ mod tests {
                 ]))),
             }),
             started_for: Duration::from_secs(90),
-            crash_relaunched: true,
+            crash_streak: 2,
+            crash_since: Some(Duration::from_secs(40)),
             abandoned: BTreeSet::from([9, 11]),
             identity: Some(identity()),
         }
@@ -549,6 +589,28 @@ mod tests {
         let mut damaged = serde_json::from_slice::<Value>(&encoded).unwrap();
         damaged["identity"]["birth"]["seconds"] = Value::from(0);
         assert!(decode(&damaged.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_handoff_from_a_02_image_carries_its_spent_relaunch_onto_the_ladder() {
+        let encoded = encode(&state()).unwrap();
+        let written = serde_json::from_slice::<Value>(&encoded).unwrap();
+        // An older image reads only this field, so it is written for a rollback.
+        assert_eq!(written["crash_relaunched"], Value::from(true));
+        for (spent, streak, since) in [(true, 1, Some(Duration::from_secs(90))), (false, 0, None)] {
+            let mut old = written.clone();
+            let root = old.as_object_mut().unwrap();
+            root.remove("crash_streak");
+            root.remove("crash_since_ms");
+            root.insert("crash_relaunched".to_string(), Value::from(spent));
+            let decoded = decode(&old.to_string()).unwrap();
+            assert_eq!((decoded.crash_streak, decoded.crash_since), (streak, since));
+        }
+        let mut none = written;
+        let root = none.as_object_mut().unwrap();
+        root.remove("crash_streak");
+        root.remove("crash_relaunched");
+        assert!(decode(&none.to_string()).is_err());
     }
 
     #[test]

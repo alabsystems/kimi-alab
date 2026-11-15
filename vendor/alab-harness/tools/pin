@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copy one tagged version of this repository into a harness checkout, as the
+# README's "How a harness pins it" says: the tag's tree, byte for byte, at
+# <checkout>/vendor/alab-harness/, and its git tree id in
+# <checkout>/vendor/alab-harness.pin. The harness then depends by path on
+# vendor/alab-harness/crates/<crate>. Nothing is committed in the harness.
+#
+# usage: tools/pin <harness-checkout> <tag>
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+[ $# -eq 2 ] || { echo "usage: tools/pin <harness-checkout> <tag>" >&2; exit 2; }
+dest=$(cd "$1" && pwd)
+tag=$2
+case $tag in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "pin: $tag is no release tag (vX.Y.Z)" >&2; exit 2 ;; esac
+tree=$(git -C "$here" rev-parse --verify --quiet "refs/tags/$tag^{tree}") \
+  || { echo "pin: this repository has no tag $tag" >&2; exit 1; }
+git -C "$dest" rev-parse --show-toplevel >/dev/null 2>&1 \
+  || { echo "pin: $dest is no git checkout" >&2; exit 1; }
+[ "$(git -C "$dest" rev-parse --show-toplevel)" = "$dest" ] \
+  || { echo "pin: $dest is not the top of its checkout" >&2; exit 1; }
+if [ -n "$(git -C "$dest" status --porcelain -- vendor/alab-harness vendor/alab-harness.pin)" ]; then
+  echo "pin: $dest has uncommitted changes under vendor/alab-harness; commit or drop them first" >&2
+  exit 1
+fi
+rm -rf "$dest/vendor/alab-harness"
+mkdir -p "$dest/vendor/alab-harness"
+git -C "$here" archive --format=tar "$tag" | tar -x -C "$dest/vendor/alab-harness"
+printf 'tag=%s\ntree=%s\n' "$tag" "$tree" >"$dest/vendor/alab-harness.pin"
+echo "pinned $tag (tree $tree) into $dest/vendor/alab-harness"
+echo "next: git -C $dest add -f vendor/alab-harness vendor/alab-harness.pin (-f: the copy is whole even where the harness ignores a name), commit, then tools/check-pin $dest"

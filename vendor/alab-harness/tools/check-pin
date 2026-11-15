@@ -1,0 +1,34 @@
+#!/bin/sh
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# A harness's release check of its copy of this repository (README, "How a
+# harness pins it"): the copy committed at vendor/alab-harness is the tree its
+# vendor/alab-harness.pin names, the working copy holds no change to it, and
+# that tree is the tree of the pinned tag here. Git tree ids are equal exactly
+# when every path, mode and byte is, so one comparison covers the copy.
+#
+# usage: tools/check-pin <harness-checkout>
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+[ $# -eq 1 ] || { echo "usage: tools/check-pin <harness-checkout>" >&2; exit 2; }
+dest=$(cd "$1" && pwd)
+pin="$dest/vendor/alab-harness.pin"
+[ -f "$pin" ] || { echo "check-pin: $dest has no vendor/alab-harness.pin" >&2; exit 1; }
+tag=$(sed -n 's/^tag=//p' "$pin")
+want=$(sed -n 's/^tree=//p' "$pin")
+[ -n "$tag" ] && [ -n "$want" ] || { echo "check-pin: $pin names no tag= and tree=" >&2; exit 1; }
+have=$(git -C "$dest" rev-parse --verify --quiet "HEAD:vendor/alab-harness") \
+  || { echo "check-pin: $dest commits no vendor/alab-harness" >&2; exit 1; }
+[ "$have" = "$want" ] \
+  || { echo "check-pin: the committed copy is tree $have; the pin names $want ($tag)" >&2; exit 1; }
+if [ -n "$(git -C "$dest" status --porcelain --ignored=matching -- vendor/alab-harness vendor/alab-harness.pin)" ]; then
+  echo "check-pin: the working copy changes vendor/alab-harness:" >&2
+  git -C "$dest" status --short --ignored=matching -- vendor/alab-harness vendor/alab-harness.pin >&2
+  exit 1
+fi
+tagged=$(git -C "$here" rev-parse --verify --quiet "refs/tags/$tag^{tree}") \
+  || { echo "check-pin: this repository has no tag $tag" >&2; exit 1; }
+[ "$tagged" = "$want" ] \
+  || { echo "check-pin: $tag here is tree $tagged; the pin names $want" >&2; exit 1; }
+echo "check-pin: $dest carries $tag exactly (tree $want)"

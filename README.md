@@ -85,9 +85,9 @@ The child runs in the harness's process group on the inherited terminal (no pty 
 
 | Signal to the harness | What happens |
 |---|---|
-| `SIGINT`, `SIGQUIT` | Ignored by the harness. They belong to the child, which already has them from the terminal. |
+| `SIGINT`, `SIGQUIT` | Ignored by the harness while a child runs: they belong to the child, which already has them from the terminal. While a crashed child is being brought back (no child runs), they end the harness with the crashed child's status. |
 | `SIGTSTP` (`^Z`) | Default: the harness stops with the child. When the child stops itself, the harness stops too, and on `SIGCONT` it continues the child. |
-| `SIGHUP`, `SIGTERM` | Passed on to the child. The harness ends with the child's status and never relaunches after one. |
+| `SIGHUP`, `SIGTERM` | Passed on to the child. The harness ends with the child's status and never relaunches after one. While no child runs, they end the harness with the crashed child's status. |
 | `SIGUSR1` | The idle attestation (see below). |
 
 The harness exits with the child's exit code, or dies by the signal that killed the child (with
@@ -126,7 +126,7 @@ and child keep running.
 
 **The safe point needs both halves:**
 
-* **An idle attestation**: under a proven aterm contract-3 `upgrade` claim, a fresh policy and
+* **An idle attestation**: under a proven aterm `upgrade` claim (contract 4 or 3), a fresh policy and
   status read says `agent=idle`, `composer=empty` or `placeholder`, upgrades are enabled without
   asking, and nobody is typing or holding the session. aterm's evidence is checked again at the
   actual stop point. Outside aterm (or as an explicit override), `kill -USR1 <kimi-alab pid>`
@@ -150,37 +150,100 @@ Every decision is written to a one-line-per-event journal (`START`, `UPDATE`, `A
 it. It rotates at 4 MiB.
 
 Tuning (and testing) knobs: `KIMI_ALAB_POLL_MS` (20–5000, default 250), `KIMI_ALAB_QUIET_MS`
-(at least 200, default 10000), `KIMI_ALAB_ATTEST_MS` (default 120000).
+(at least 200, default 10000), `KIMI_ALAB_ATTEST_MS` (default 120000),
+`KIMI_ALAB_RESTART_WAIT_MS` (100–3600000, default 45000: how long a restart aterm asked for may
+wait before it is refused).
 
 ### aterm supervision: proven relaunch and upgrade claims
 
-Inside aterm, the harness reads `@self harness policy` over the session's authenticated control
-socket and, when the host serves contract 3 with supervision effective, claims
-`kimi-alab@<pid> contract=3 scope=relaunch,upgrade version=<version> [vendor=<vendor version>]`
-before it spawns Kimi. It keeps that connection open, requires `status` to confirm
-`supervisor_proven=1`, reconnects if the connection is lost, and re-announces the vendor after
-every move.
+The link to aterm is the shared ALab library `alab-wire` (crate `crates/alab-wire` of
+`alab-harness`; see "Build and test" for how it is pinned). kimi-alab keeps only what is its own
+(`src/aterm.rs`): its id `kimi-alab`, its vendor word `kimi`, the duties it claims
+(`relaunch,upgrade`), `ATERM_NO_HARNESS`, its clock, and what Kimi Code needs (its account home
+`KIMI_CODE_HOME`, its session locks and its process walk). Inside aterm, the harness claims the
+session before it spawns Kimi, over the session's authenticated control socket, in this order:
 
-A noninteractive launch, `--alab-no-update`, `ATERM_NO_HARNESS=1`, a missing/older control socket,
-a refused or unproven claim, or a policy with supervision off makes the harness **exec the vendor
-in its place** instead. Kimi then runs under its own name with no second supervisor. aterm's
-built-in Kimi policy retains turn-end, approvals, questions and walls. `kimi-alab --alab-which`
-names the scopes it will claim.
+1. `@self harness policy` must serve contract 4 or 3 with `effective=on`; the claim is made at
+   the highest of the two it lists (alab-wire chooses). The reply is read strictly: `gen=`,
+   `contract=`, `effective=`, `relaunch=`, `upgrade=`, `upgrade_ask=` and `human_grace_s=` must
+   each be there once and in their grammar; nothing is defaulted.
+2. **The roster guard, under contract 3.** A read-only `@self native-act info` must name
+   `kimi-alab:upgrade` in its `own-image=` list (aterm's `ROSTER`). Without the row nothing is
+   claimed, not even to find out: aterm stores a contract-3 claim from a holder off its roster as
+   a foreign claim that takes every duty from its built-in engine. Contract 4 has no roster to
+   ask: aterm proves a holder by its registry row and answers one it cannot prove `ERR unproven`.
+3. The claim: `kimi-alab@<pid> contract=<4|3> scope=relaunch,upgrade version=<version>
+   [vendor=<vendor version>] [child=<pid>:<start>] [login=<label>]` (`child=` under contract 4
+   only). A contract-4 reply states the grant, `OK scope=<granted> revision=<n>`.
+4. `status` must read it back as `supervisor=kimi-alab@<pid> supervisor_proven=1` with
+   `supervisor_scope` naming every duty granted (under contract 3, both duties claimed). A claim
+   that reads otherwise is released (`meta unset supervisor`). A launch whose contract-4 grant is
+   narrower than both duties releases it too.
+5. `subscribe @self events` on a second connection. aterm acknowledges with `OK subscribe 1` and
+   `sub <local id> <sid> role=… attention=… user_title=…`, and its events name the local id
+   (`EVENT <local id> restart cause=…`); a line for any other id ends the stream, which is
+   reopened on the 5 s clock.
 
-While Kimi runs, the harness follows the session id in its lock. After an abnormal exit or fault,
-a fresh proven claim and `[harness] relaunch = true` let it resume that session with the carried
-flags and `--session <id>`, on the same build when it remains usable. A second crash within the
-15-second startup grace ends with the child's status instead of looping. Clean exits, intentional
-`HUP`/`TERM` endings, and crashes without a proven session id or relaunch claim keep their original
-status.
+After every child start, the first included, the claim is sent again naming the new child's pid
+and kernel start time and its build and account; under contract 4 its reply is the grant from
+then on.
 
-aterm's explicit, stall and memory-pressure restart acts publish `restart cause=<why>` on the
-session's event stream for a proven relaunch claimant instead of signalling its process group. The
-harness subscribes on a second authenticated connection, rechecks its claim and relaunch policy,
-and resumes the locked session on the same build with the carried flags and `--session <id>`. It
-sends Kimi one graceful `SIGTERM`; if that move cannot be proven or the child's exit is not the
-expected one, the harness reports the refusal or child's status rather than killing the group or
-restarting unconditionally. A lost event connection is reopened with the current control socket.
+A noninteractive launch, `--alab-no-update`, `ATERM_NO_HARNESS=1`, a missing or older control
+socket, a policy with supervision off by configuration, a host whose roster lacks the row (under
+contract 3), or a claim that is refused, unproven or granted less than both duties makes the
+harness **exec the vendor in its place** instead. Kimi then runs under its own name with no
+second supervisor. If aterm is there but cannot say now (an `ERR` that asks to be retried, which
+it answers at once while it shows a dialog or its main thread is stalled; a reply later than its
+bound after the handshake, which is aterm busy, not gone; a policy off for a reason that passes),
+or serves no contract the harness can claim at yet, the child runs supervised and the whole claim
+sequence is tried again every 5 s. The same 5 s clock claims a lost claim again, and reopens a
+lost event stream, whatever else the harness is doing; each of those exchanges waits for aterm
+at most 500 ms. `kimi-alab --alab-which` names the scopes it will claim.
+
+**Crash relaunch.** While Kimi runs, the harness follows the session id in its lock. When the
+child ends abnormally (a non-zero exit other than 129, 130, 131 and 143, or death by a signal
+other than `INT`, `QUIT`, `TERM` and `HUP`) and nobody passed the harness `HUP`/`TERM`, the
+crash is answered under aterm's own rule (aterm `crates/aterm-agent/src/harness/relaunch.rs`,
+ported in alab-wire's `relaunch` module):
+
+* The terminal's modes are put back at once, with the keyboard, mouse and paste reporting reset
+  on both screens, so Ctrl-C reaches the harness while no child runs.
+* **The back-off.** The relaunch waits 1 s after the first crash, 10 s after the second, 60 s
+  after the third and 10 minutes after every one after. A child that runs 10 minutes after its
+  last crash relaunch starts the ladder over. The streak crosses a harness re-exec.
+* **Whose exit it was.** One fresh `harness policy` and `status` read at the exit, and another
+  at the end of the pause, must show this harness's proven claim taking `relaunch`, the policy
+  in effect (a halt reads `effective=off why=hold`), `[harness] relaunch = true`, nobody typing
+  within `human_grace_s`, `hold=0`, and no other driver's hand (`hand=lease:…` or
+  `hand=turn:<id>:<holder>`). A fact `status` does not state holds. Anything else passes the
+  crash on: the harness exits with the child's status and journals `CRASH-PASSED-ON <why>`.
+* **aterm away.** If the claim's connection fails, or aterm answers `ERR`, the crash waits: aterm
+  is asked again every second once the link is held, for at most 45 s of time actually spent
+  waiting for this crash, and the crash is then passed on (`claim-not-proven-again`).
+* `INT`, `QUIT`, `HUP` or `TERM` during the pause or the wait ends the harness with the crashed
+  child's status, including one caught just before the relaunch would start. What was typed at
+  the dead screen is discarded before the relaunch and before a crash is passed on, so neither
+  the resumed Kimi nor a parent shell reads it.
+* The relaunch resumes the session with the carried flags and `--session <id>` on the same build
+  when it is still usable.
+
+**Restarts aterm asks for.** aterm's explicit, stall and account restart acts publish
+`restart cause=<why>` on the session's event stream for a proven relaunch claimant instead of
+signalling its process group. The harness checks one fresh policy and status read: its proven
+claim taking `relaunch`, the policy in effect, `hold=0` and no other driver's hand. The person's
+grace is not read (whoever asked is the person), and `[harness] relaunch = false`, which limits
+crash relaunches, does not limit an asked restart, as in aterm. A restart that cannot be made yet
+(aterm answered `ERR`, the link was lost, or the child's lock names no session) waits at most
+45 s from its arrival, whatever it waits for, and is then refused (`RESTART-REFUSED cause=… not
+made within 45000 ms: …`). A restart that arrives before a new child is announced (as the last
+one ends, or while the next starts) was meant for the child that ended and is passed over
+(`RESTART-PASSED-OVER`), as is one that still waited when that child ended. The harness sends
+Kimi `SIGTERM`, and `SIGKILL` if
+it is still running 5 s later for a `stall` restart or 30 s later otherwise
+(`KIMI_ALAB_TERM_GRACE_MS` bounds both), as aterm's own act does. When the child has ended by
+either signal, the session is resumed with the carried flags and `--session <id>`, on the build
+atpkg has current at that moment, else the same build. A restart is no crash and does not move
+the back-off.
 
 aterm's account pool can also publish `restart cause=account[-ahead] to=<label> home=<pct>`.
 The harness applies the selected `KIMI_CODE_HOME`, removes `KIMI_MODEL_NAME`,
@@ -192,16 +255,35 @@ stays on later crash and upgrade relaunches. Each successful child start re-anno
 from an event merely queued. A lost-login renewal uses the same handoff; no Claude-style `/login`
 dialog is driven.
 
+**A halt holds.** Under a standing claim, an update a person attested with `SIGUSR1` still needs
+aterm to read no halt, no other driver's hand and the upgrade duty still granted to this harness
+at the stop point; aterm's own attestation needs its whole safe point. A halt never releases the claim: the move waits and goes ahead under the
+same claim once the halt lifts.
+
 ## Build and test
 
 Rust here is the Trust toolchain (`rust-toolchain.toml`: `channel = "trust"`).
 
+The aterm client is `alab-wire`, built by path from the copy of alab-harness `v0.1.0` this
+repository carries at `vendor/alab-harness/` (`vendor/alab-harness/crates/alab-wire`), pinned
+by that tag's git tree id in `vendor/alab-harness.pin` (decision 37). A clone builds alone: no
+sibling checkout and no git dependency. The copy is its own workspace (`exclude = ["vendor"]`)
+and is never edited here. alab-harness's `tools/pin <this checkout> <tag>` replaces it whole,
+then `git add -f vendor/alab-harness vendor/alab-harness.pin` and a commit take it (`-f`: the
+copy is whole even where this repository ignores a name), and its `tools/check-pin <this
+checkout>` is the release check (copy, pin and tag the same tree). To move to a newer
+alab-harness, pin its tag the same way.
+
 ```sh
 targo --unverified build --release        # target/release/kimi-alab
-targo --unverified test                    # unit + integration tests
-targo tippy --all-targets -- -D warnings
+targo --unverified test --locked           # unit + integration tests
+targo tippy --locked --all-targets -- -D warnings
 targo fmt --check
 ```
+
+`tests/pin.rs` holds the half of that check a checkout alone can: the committed
+`vendor/alab-harness` is the tree the pin names, and the working copy changes none of it, an
+ignored stray file included.
 
 The integration tests (`tests/harness.rs`) lay a fake `kimi` in a scratch atpkg store and run
 the real harness binary, on a real pty where the test needs a terminal. They cover argument
@@ -213,6 +295,22 @@ way the harness could run itself (a store binary that is the harness, a store `k
 `exec`s it or runs it as a child, an update to it, a relaunch candidate that is it), a move
 with a broken standard error, and a check that the OS's tty times move as the safe point
 assumes.
+
+The aterm scenarios run the real harness binary against alab-wire's fake aterm (feature `fake`):
+a Unix socket that answers as aterm does, with the strict policy line serving contracts 2, 3 and
+4, `native-act info` with a roster, contract 4's grant and contract 3's bare `OK`, the claim read
+back with its scope, the subscription acknowledged with a local id, and restart events. A test
+can serve only contracts 2 and 3, take the row off the roster, grant fewer words, cap the claim
+between its reply and its read, halt the session, put a driver's hand or a person's typing on
+it, turn `relaunch` off, delay every reply, or make policy reads answer `ERR`. The scenarios
+cover the claim at contract 4 and at contract 3 with each child named after it starts, the
+roster and scope refusals under both contracts, a launch that meets an `ERR` and one aterm
+answers late (busy, not gone), the move under a claim and under a halt, crash relaunch with the
+back-off ladder, a crash a person owns, a crash waiting out aterm's `ERR` and a signal during
+that wait, and the restart events (asked, account, a model move refused, refused under a
+driver's hand, made under `relaunch = false`, and a deaf child escalated to `SIGKILL`). How the
+wire, the claim, the link and the ladder behave alone is alab-wire's own tests' to show,
+events for another subscription's id among them.
 
 ## Rulings this follows
 
@@ -241,6 +339,8 @@ Read, not guessed:
 * aterm `crates/atpkg/src/vendor_direct/table.rs:659-735` (the `kimi` row), `store.rs`
   (`current`, `.ready`), `shim_env.rs`: the store layout and admission rules ported in
   `src/store.rs`.
+* alab-harness `crates/alab-wire` (README Decisions, `docs/HX-06-aterm-map-2026-11-13.md`): the
+  aterm client, contracts 3 and 4, and the exit judgement and crash ladder ported from aterm.
 * aterm `crates/aterm-phase/src/kimi.rs`: the measured spinner/idle grammar and composer reader.
   aterm publishes those as `agent=` and `composer=`; the harness still applies its own terminal,
   process-tree and CPU backstops before stopping a child.
@@ -274,7 +374,7 @@ Choices made without the owner, each fail-closed and reversible:
    versions itself.
 5. **The safe point is attested, not inferred.** The harness inherits the terminal and cannot
    read the screen itself. A move needs aterm's fresh idle/composer attestation under a proven
-   contract-3 claim, or an idle attestation (`SIGUSR1`) elsewhere, plus the harness's tty,
+   claim (contract 4 or 3), or an idle attestation (`SIGUSR1`) elsewhere, plus the harness's tty,
    process-tree and CPU backstops. Without an attestation the update waits for the next launch.
    **This never blocks on a person.** The session keeps running on its build, nothing prompts,
    and nobody is asked.
@@ -289,10 +389,11 @@ Choices made without the owner, each fail-closed and reversible:
    these per session, and the flags would override what the person changed during the
    session (kimi-tui.ts 1050-1053, 2916-2930). `--skills-dir` and `--add-dir` are carried.
    An unknown flag refuses the move.
-9. **Relaunch only after our own `SIGTERM` ended the child.** If the child ends any other way
-   during a move (a crash, an exit code other than 143), or `HUP`/`TERM` reached the harness,
-   that ending is the session's real end. The harness exits with it and prints
-   `kimi -r <id>`. This release never relaunches a crashed child.
+9. **A move or restart goes on only after the harness's own signal ended the child.** If the
+   child ends any other way during a move (a crash, an exit code other than 143), or
+   `HUP`/`TERM` reached the harness, that ending is the session's real end. The harness exits
+   with it and prints `kimi -r <id>`. For a restart aterm asked for, the harness's own `SIGKILL`
+   (decision 28) is such a signal too. A crash outside a move is answered by decision 24.
 10. **The candidate order for the relaunch** is the build current at that moment, then the build
     the move was decided for, then the old build. Each is re-checked as a complete store build,
     so a withdrawn or half-written build is skipped.
@@ -373,26 +474,200 @@ Choices made without the owner, each fail-closed and reversible:
     harness claims `relaunch,upgrade` under contract 3. It starts no child until aterm confirms the
     claim as proven, and every host-driven move requires a fresh idle/composer read both when the
     attestation opens and immediately before `SIGTERM`; the local terminal, process-tree and CPU
-    backstops still apply. Any startup or connection failure execs the vendor or holds the move,
-    never leaves a second supervisor of the same duty. The typing scopes remain unclaimed until
-    their own implementations and tests land.
-24. **Crash relaunch is proven from the running child and bounded (2026-11-06).** Only an abnormal
-    exit or fault qualifies, and only with a fresh proven relaunch claim and the session id most
-    recently proven by the running child's lock. A second crash within 15 s ends with the child's
-    status rather than forming a relaunch loop; a stable child re-arms relaunch after that grace.
-    Clean and intentional exits never take this branch.
+    backstops still apply. Any refusal at launch execs the vendor, and a failed connection holds
+    the move, never leaving a second supervisor of the same duty. The typing scopes remain
+    unclaimed until their own implementations and tests land. Revised by decision 25.
+24. **Crash relaunch is aterm's own rule, with aterm's back-off (2026-11-13; aterm
+    `crates/aterm-agent/src/harness/relaunch.rs`, `on_exit`, `BACKOFF`, `HEALTHY`).** Only an
+    abnormal end nobody signalled qualifies, and only with the session id most recently proven by
+    the child's lock. It waits 1 s, 10 s, 60 s, then 600 s for each crash in a streak, and a
+    10-minute run forgives the streak. A fresh policy and status read at the exit and again at the
+    end of the pause must show the proven claim taking `relaunch`, the policy in effect, the
+    switch on, and nobody else's exit: a person who typed within `human_grace_s`, a halt, another
+    driver's hand, or a fact `status` does not state each pass the crash on. Before, one crash
+    was relaunched at once and a second within 15 s ended the session, so a child that crashed
+    every 16 s was relaunched forever with no pause, and an exit just after a person typed (or
+    under a halt or a driver's lease) was brought back over them. alab-wire's `relaunch` module
+    (formerly `src/relaunch.rs`, decision 33) keeps aterm's order with three stricter differences,
+    named in its module text.
+
+25. **The roster guard, and the scope read back (2026-11-13; aterm
+    `crates/aterm-agent/src/harness/contract.rs` `ROSTER`, `crates/aterm-gui/src/native_act.rs`
+    `own_image_rows`).** The harness asks `native-act info` before it claims and claims only when
+    `own-image=` names `kimi-alab:upgrade`; a proven claim must also read back with
+    `supervisor_scope` naming `relaunch` and `upgrade`, or it is released. Before, the claim was
+    sent straight after the policy read: on an aterm serving contract 3 without the row, it was
+    stored as a foreign claim taking every duty, and nothing checked which duties a proven claim
+    took. The policy reply is read strictly (no field defaulted), so a host that does not say
+    whether it permits a duty has not permitted it.
+26. **An `ERR` from aterm is "cannot say now", not "no" (2026-11-13).** aterm answers a policy or
+    status read with `ERR` at once while it shows a dialog or its main thread is stalled
+    (`crates/aterm-gui/src/control_media.rs` `main_thread_refusal`). At launch that keeps the
+    child supervised and the claim is tried again every 5 s; for a crash or an asked restart it is
+    waited for like a lost connection. Only an answer that was read and refuses passes a crash on.
+27. **The wait for aterm is a budget, not a deadline (2026-11-13).** One crash waits for aterm at
+    most 45 s (aterm's own grace for a claim whose connection went away), counted only while it
+    waits, so a second loss at the end of a 60 s or 600 s pause still gets what is left instead of
+    nothing.
+28. **An asked restart is made whatever the child does with its `SIGTERM` (2026-11-13; aterm
+    `crates/aterm-gui/src/restart_act.rs` `escalate`).** Under a `relaunch` claim aterm hands its
+    restart act to the holder and arms no `SIGKILL` of its own, so the harness escalates as the
+    act would: 5 s for a `stall` restart (a stalled program reads nothing, so it cannot take the
+    signal), 30 s otherwise. Before, a deaf child kept running and the restart was abandoned.
+    The update move keeps its single `SIGTERM` (decision 22): a busy `kimi` is never stopped.
+29. **An asked restart refuses a held session; `relaunch = false` does not limit it (2026-11-13;
+    aterm `crates/aterm-gui/src/input_stall.rs` `other_hand`, `harness_host.rs`).** aterm's own
+    restart act refuses `halted`, `driver-turn` and `driver-lease` whoever asks, and skips that
+    check for a session whose claim takes `relaunch`, so the harness checks `hold=` and `hand=`
+    itself. aterm's host relaunches an asked exit whatever the switch, so the harness does too.
+    A halt (`hold=1`, which the policy reports as `effective=off why=hold`) holds every act and
+    never releases the claim.
+30. **No child, no keyboard taken (2026-11-13).** When the child dies, the terminal's saved modes
+    and plain keyboard reporting come back at once, before any wait, and `INT`, `QUIT`, `HUP` and
+    `TERM` end the harness with the crashed child's status for as long as no child runs, a signal
+    caught just before the relaunch included. Keys typed at the dead screen are discarded, so a
+    resumed Kimi never receives them as a prompt and a parent shell never runs them.
+31. **aterm's silence never holds the loop (2026-11-13).** The launch opens its connections and
+    makes its first claim with 2 s per socket operation; every exchange after that, a claim made
+    again from the loop included, has 500 ms (claude-code-alab's bounds). Before, one silent
+    aterm held the loop that reaps the child and passes on its signals for 5 s per operation.
+    An exchange that outlives its bound drops the connection, so the claim is made again later.
+    A launch whose first claim aterm answers the handshake of and then answers late is aterm
+    busy, not away (aterm answers through its main thread and says `ERR` only after a 5 s
+    stall, never while it launches): the child runs supervised and is claimed again on the 5 s
+    clock, as for an `ERR`, instead of running unsupervised for the whole session.
+32. **Time stopped is not grace (2026-11-13).** The grace after the harness's own `SIGTERM` or
+    `SIGKILL` runs on a clock that stops while the machine sleeps, and starts again whenever the
+    child is continued, since a stopped child acts on no signal but `SIGKILL`: when the harness
+    continues a child that stopped alone, and when a whole-job `^Z` stopped the harness with it
+    and the shell's `fg` continued both (the kernel then reports only the continue). Before, a child stopped past the grace was killed or its move abandoned the moment
+    it was continued.
+33. **The aterm client is the shared library `alab-wire` (2026-11-14; aterm tracker HX-09).**
+    `src/link.rs`, `src/relaunch.rs` and all but kimi-alab's own part of `src/aterm.rs` are gone:
+    the wire, the claim and its guards, the link held, lost and claimed again, the exit judgement,
+    the crash ladder and the 45 s budget are alab-wire's, and their unit tests with them. The
+    integration tests run the harness against alab-wire's fake aterm instead of their own. What
+    stays here is this harness's: its config (`kimi-alab`, `kimi`, `relaunch,upgrade`),
+    `ATERM_NO_HARNESS`, the clock the link runs on (decision 35), the claim's child (`child=<pid>:<start>` read with
+    alab-wire's `ChildProcess::of`), the check of a move a person attested by hand, the journal
+    events made from the link's notes (`aterm claimed …` is `CLAIMED …`), and everything Kimi
+    Code needs. alab-wire is built from the vendored copy of alab-harness `v0.1.0`, pinned by
+    its tree id (decision 37); the port first took it by path from a sibling checkout. The
+    decisions above stand, carried by alab-wire: busy is not gone after the handshake (31), the
+    2 s and 500 ms bounds (31), the roster guard before a contract-3 claim (25), the scope read
+    back (25), the crash back-off and its budget (24, 27). The grace restarted on a continue
+    (32) is the supervisor's and stays here.
+34. **What changed with alab-wire (2026-11-14).** Each follows alab-wire's decisions, recorded
+    there.
+    * **Contract 4 is preferred.** The claim is made at the highest contract aterm's policy lists
+      (4, else 3). Under contract 4 there is no roster guard (aterm proves the holder by its
+      registry row and answers an unproven one `ERR unproven`), the reply states the grant, and
+      every child start is announced with `child=<pid>:<start>`. A launch granted less than both
+      duties releases the claim and passes the vendor through, as decision 25 does under
+      contract 3; a cap that narrows a standing claim later only narrows what the harness does,
+      since every relaunch and safe point is judged on `status`'s scope.
+    * **Only an `ERR` that asks to be retried is "cannot say now".** aterm's dialog and stall
+      refusals end in `retry`; any other `ERR` (an unknown session, a refused principal) is a
+      refusal. Decision 26 read every `ERR` as "cannot say now".
+    * **A launch not yet claimed has no duty to a crash.** A launch whose claim aterm could not
+      make yet runs its child supervised and claims on the clock; a crash before that claim is
+      made is passed on (`no-claim`), since nothing took the relaunch duty from aterm's engine.
+      Before, it waited up to 45 s for a claim. A child adopted across a harness re-exec keeps its
+      claim through any refusal (alab-wire `Link::adopt_with`): the earlier image's duty passes on.
+    * **A restart naming a model is refused** (`RESTART-REFUSED cause=… model=…`): Kimi Code
+      would be started on the model it ran, answering a model move with the model it moved from.
+      Choosing Kimi's model on a resume is not built yet. Before, the restart's `model=` made the
+      whole event unreadable and it was ignored.
+    * **Journal wording.** Link lines are the link's own (`CLAIMED holder=… contract=4
+      scope=relaunch,upgrade revision=… vendor=…`, `UNCLAIMED <why>`, `LOST <why>`,
+      `REANNOUNCED …`); refusals quote aterm's words journal-safe (`hand=lease:driver%25404`);
+      a move a person attested under a halt is refused with aterm's hold (`wait aterm policy
+      effective=off why=hold`).
+35. **A person's attestation needs the upgrade duty, and the link's clock stops in sleep
+    (2026-11-14; review of the HX-09 port).**
+    * **The hand path is judged on `status`'s scope.** Under contract 4 a claim can stand with
+      less than both duties: a person's cap narrows it, a reclaim after a lost link accepts a
+      narrower grant, and an adopted child keeps whatever grant it gets. A claim without
+      `upgrade` has handed that duty back to aterm's engine, so an update a person attests with
+      `SIGUSR1` under it is refused (`REFUSED aterm reads supervisor_scope=relaunch; …`), as
+      aterm's own attestation already was by alab-wire's safe-point judge. Under contract 3 such
+      a claim was always given back, so the old client never met it.
+    * **The link's clock is the one `Instant` reads:** `CLOCK_UPTIME_RAW` on macOS,
+      `CLOCK_MONOTONIC` on Linux, both stopped while the machine sleeps. The port first read
+      `CLOCK_MONOTONIC` on macOS too, which counts sleep: a closed lid spent the 45 s budget a
+      crash or a deferred restart waits for aterm (passing the crash on without asking aterm
+      again) and counted as the 600 s healthy run that resets the crash ladder. It is a system
+      clock, not one the process starts, so it reads the same on both sides of a re-exec;
+      the crash streak crosses one as a `Duration` (`Ladder::since`/`carried`) either way.
+
+36. **Three fixes carried from the review of agy-alab's port (2026-11-14; agy-alab 20be436,
+    alab-harness 9e8bc55).** kimi-alab's port shared each defect.
+    * **A restart aterm asked for waits at most 45 s from its arrival** (`Settings::restart_wait`,
+      alab-wire's `AWAY_BUDGET`; `KIMI_ALAB_RESTART_WAIT_MS` for the tests), whatever it waits
+      for, and is then refused (`RESTART-REFUSED cause=… not made within … ms: <why>`). Before,
+      a wait for the child's session lock never spent the away budget, so a restart sent to a
+      fresh Kimi was made the moment the person's first prompt opened a session, however much
+      later, ending Kimi mid-turn for a cause long gone. A restart is for the moment aterm asked
+      in; aterm asks again while its cause stands. The total bound replaces the away budget the
+      deferred restart carried, which it subsumes; a crash keeps its away budget (decision 27).
+    * **A restart that arrives before a new child is announced is passed over**
+      (`pass_over_earlier`, before every announcement: the first start, a crash relaunch, a
+      move's or restart's relaunch, a startup fallback). The loop relaunches as soon as it reaps
+      the child, so an event read in the same wake as the end, or one sent while the next child
+      was being started, was drained on the next pass and applied to the new child; aterm sent it
+      for the child that ended (`Link::events`). A restart still waiting when a child is replaced
+      by a move is passed over too: it waited for the child before.
+    * **A move a person attested is judged by alab-wire** (`claim::judge_own_move` with
+      `Warrant::Person`), replacing the hand-written `unheld`: the claim still this harness's and
+      proven, `supervisor_scope` with `upgrade`, no halt, and no other driver's hand. The person's
+      word stands over the policy's `upgrade` and `upgrade_ask` switches. The upgrade-duty check
+      decision 35 added is alab-wire's scope check, made under either warrant, so it stands
+      (`a_hand_attested_move_needs_the_upgrade_duty_granted`, unit and end to end). Journal words
+      are alab-wire's `aterm <field>=<value>`: `REFUSED aterm supervisor_scope=relaunch; …` where
+      decision 35 quoted `aterm reads supervisor_scope=relaunch`, and a lost claim is named before
+      a halt.
+37. **alab-wire is the vendored alab-harness `v0.1.0`, pinned by tree id (2026-11-14; alab-harness
+    Decision 19, aterm tracker HX-08/HX-09).** alab-harness tagged `v0.1.0` before HX-06 lands (its
+    Decision 19): the link already claims at contract 3 where aterm serves only that, so a pinned
+    harness runs on the aterm that is installed, and what HX-06's measurement finds ships as
+    `v0.1.x`. It is not a git dependency, because aterm's `deny.toml` refuses git sources.
+    alab-harness's `tools/pin` copies the tag's tree byte for byte to `vendor/alab-harness/` and
+    records its git tree id in `vendor/alab-harness.pin` (`tag=v0.1.0`,
+    `tree=f3b718df6a78a54397c48f2db0c164448741dbcb`); both `alab-wire` entries in `Cargo.toml` name
+    `vendor/alab-harness/crates/alab-wire`. A tree id is equal exactly when every path, mode and
+    byte is, so one comparison holds the whole copy: `tests/pin.rs` holds the committed copy to the
+    pin, and alab-harness's `tools/check-pin`, the release check, also holds the pin to the tag. The
+    copy is excluded from this workspace, ships in the public snapshot (`publish/manifest.txt` lists
+    `vendor`) so a public clone builds alone, and is never edited here: a defect in alab-wire is
+    fixed in alab-harness, tagged `v0.1.x` and taken by pinning again. Before, `Cargo.toml` named
+    `../alab-harness/crates/alab-wire`, so no clone built without that checkout beside it, and the
+    plan was a git tag dependency on `v0.1.0` once alab-harness had a remote (decision 33).
+    * **The workspace lists no `members = ["."]`,** unlike the example in alab-harness's README.
+      Cargo reads an explicit member `.` as every path under the root, `vendor/` included, and an
+      explicit member overrides `exclude`, so it took the vendored crate for a member of this
+      workspace and failed to inherit `workspace.package.publish`. With the root package its only,
+      implicit, member, `exclude = ["vendor"]` holds.
+    * **The tag carries four alab-wire changes made after decision 36 was tested** (alab-harness
+      9e8bc55): a release aterm will not take ends the connection (c6db9af), a test build may
+      shorten the away budget (97aff86), the policy is read on the clock while the event stream is
+      down (d64ada4), and placeholder homes in two test fixtures (de80de5). This harness's tests
+      pass against them unchanged.
 
 ## Verification status
 
 First measured 2026-10-24 on a clean clone of commit bd8547a, with the gate exactly as
 `publish/config.sh` spells it, run step by step as the publication engine runs it (rustup `trust`
 toolchain, targo 0.10.0+g41d799797). The advisory Trust check, unverified tests, lint and
-formatting were rerun on this change on 2026-11-09:
+formatting were rerun on this change on 2026-11-13, with targo straight from the atpkg store
+(this Mac has no rustup, so `rustup run trust` is dropped from each step). The unverified tests,
+lint and formatting were rerun with `--locked` on 2026-11-14 after the aterm client moved to
+`alab-wire` (decision 33), again after decisions 35 and 36, and again with alab-wire built from
+the vendored v0.1.0 (decision 37); the Trust rows were not rerun on those changes:
 
 | Step | Result |
 |---|---|
-| `targo trust check --allow-l0-gaps` (verified, advisory lane) | exit 3, `Gate: COULD-NOT-RUN [advisory lane, exit 3]`. **0 refuted.** 542 functions: 215 rows proved, 366 runtime-checked, 453 unknown. |
-| `targo --unverified test` (no proof claim) | exit 0: 65 unit and 35 integration tests passed |
+| `targo trust check --allow-l0-gaps` (verified, advisory lane) | exit 3, `Gate: COULD-NOT-RUN [advisory lane, exit 3]`. **0 refuted.** 652 functions: 255 rows proved, 416 runtime-checked, 498 unknown. |
+| `targo --unverified test` (no proof claim) | exit 0: 72 unit, 53 integration and 1 pin test passed |
 | `targo tippy -- -D warnings` (clippy pedantic) | exit 0 |
 | `targo fmt --check` | exit 0 |
 | `targo trust check` (strict lane, not the gate) | exit 1 on the same unknown rows; 0 refuted (measured on 64fd067, not rerun since) |
@@ -405,7 +680,20 @@ no-verdict exit 3 with zero refutations when every other step passes. A refutati
 compile error or a failing test still fails the gate. The verifier's first runs refuted 23
 rows: unchecked arithmetic in the `ps`/`/proc` parsers, the vendor build-id decoder and the
 exit-code fold. Each was fixed in the code (checked arithmetic, `NonZeroU64` divisors), not
-excused, and the tests that pin the fixed behaviour are in `src/proc.rs` and `src/store.rs`.
+excused, and the tests that pin the fixed behaviour are in `src/proc.rs` and `src/store.rs`. The
+first run on the 2026-11-13 supervision change refuted 35 more: array indexing by an unbounded
+slot in the strict policy parser, and reads and writes through `Box`ed enum payloads, which the
+verifier fails closed on. The parser now reads a keyed map, and the three enums keep their
+payloads inline (clippy's `large_enum_variant` is allowed on each, with that reason).
+
+**Linux.** The Linux code (the `/proc` process table and identity, the XDG journal path) was
+type-checked and linted on 2026-11-14 for `x86_64-unknown-linux-gnu` and
+`aarch64-unknown-linux-gnu`, cross-checked from macOS with stable `cargo clippy --locked
+--all-targets --target <target> -- -D warnings` (clippy pedantic, tests included): exit 0 on
+both. It has never been run: no test above ran on Linux. The Linux arm of the link's clock
+(decision 35, `CLOCK_MONOTONIC` through rustix, the reading the port already made) was not
+cross-linted again: this Mac has no stable cargo, and the Trust toolchain has no Linux standard
+library to check against.
 
 ## License
 

@@ -7,7 +7,7 @@
 //! busy child. The harness inherits the terminal and does not proxy it, so it cannot read the
 //! screen itself. The decision has two halves, and BOTH must hold:
 //!
-//! 1. **An idle attestation** — under a proven aterm contract-3 upgrade claim, one fresh
+//! 1. **An idle attestation** — under a proven aterm `upgrade` claim (contract 4 or 3), one fresh
 //!    policy/status pair saying the turn is idle, the composer empty or placeholder, nobody typing
 //!    or holding the session, and upgrades enabled. Elsewhere `SIGUSR1` vouches for those facts.
 //!    Aterm's evidence is refreshed again at the actual stop point. An attestation is good for

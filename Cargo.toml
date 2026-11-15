@@ -1,9 +1,13 @@
+# The root package is this workspace's only member. The vendored alab-harness copy is its own
+# workspace, never a member of this one. No `members = ["."]`: an explicit member "." names
+# every path under the root, vendor/ included, and overrides the exclusion, so cargo would read
+# the vendored crate as a member of this workspace and fail to inherit its package fields.
 [workspace]
-members = ["."]
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0 OR MIT"
@@ -14,6 +18,91 @@ repository = "https://github.com/alabsystems/kimi-alab"
 # one binary, and its row in programs::PROGRAMS names the same tool).
 [workspace.metadata.atpkg]
 expose = ["kimi-alab"]
+
+# What a package of main is held to before aterm's tip lane (`atpkg-publish lane run tip`)
+# stages it: the format, lint and test steps of this repository's release gate
+# (publish/config.sh), then the pack itself, then the controls build 33 was verified with,
+# run on the packed binary. Each step passes only if it exits 0 within `within-secs`.
+[[workspace.metadata.atpkg.qualify]]
+name = "fmt"
+stage = "source"
+run = ["targo", "fmt", "--check"]
+within-secs = 600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "tippy"
+stage = "source"
+run = ["targo", "tippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
+within-secs = 3600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "test"
+stage = "source"
+run = ["targo", "--unverified", "test", "--locked", "--workspace"]
+within-secs = 3600
+# 126 on 2026-11-14 (72 unit, 53 in tests/harness.rs, 1 in tests/pin.rs); 118 when the aterm
+# client moved to alab-wire, whose unit tests went with it (README decision 33).
+min-tests = 115
+
+[[workspace.metadata.atpkg.qualify]]
+name = "build"
+stage = "build"
+within-secs = 3600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "version"
+stage = "packed"
+run = ["{bin}/kimi-alab", "--version"]
+within-secs = 120
+
+[[workspace.metadata.atpkg.qualify]]
+name = "harness-help"
+stage = "packed"
+run = ["{bin}/kimi-alab", "--alab-help"]
+within-secs = 120
+
+# Exits 127 on a machine whose atpkg store holds no Kimi Code to run.
+[[workspace.metadata.atpkg.qualify]]
+name = "which"
+stage = "packed"
+run = ["{bin}/kimi-alab", "--alab-which"]
+within-secs = 120
+
+# The two refusals: an unknown harness option and a `run` envelope with no `--` each exit 2
+# and start nothing.
+[[workspace.metadata.atpkg.qualify]]
+name = "invalid-harness-option"
+stage = "packed"
+run = ["/bin/sh", "-c", '''
+"{bin}/kimi-alab" --alab-definitely-not-a-real-option </dev/null >/dev/null 2>&1; [ $? -eq 2 ]
+''']
+within-secs = 120
+
+[[workspace.metadata.atpkg.qualify]]
+name = "invalid-run-envelope"
+stage = "packed"
+run = ["/bin/sh", "-c", '''
+"{bin}/kimi-alab" run </dev/null >/dev/null 2>&1; [ $? -eq 2 ]
+''']
+within-secs = 120
+
+# Pass-through: the store's Kimi Code and the packed harness in front of it print the same
+# help, and refuse the same unknown option with the same status and the same words.
+[[workspace.metadata.atpkg.qualify]]
+name = "vendor-passthrough"
+stage = "packed"
+run = ["/bin/sh", "-c", '''
+d=$(mktemp -d) || exit 1; trap 'rm -rf "$d"' EXIT
+export KIMI_CODE_NO_AUTO_UPDATE=1 KIMI_ALAB_JOURNAL="$d/journal.log"
+vendor=$("{bin}/kimi-alab" --alab-which | sed -n 's/^binary  *//p'); [ -x "$vendor" ] || exit 1
+"$vendor" --help </dev/null >"$d/vendor-help" 2>/dev/null || exit 1
+"{bin}/kimi-alab" --alab-no-update --help </dev/null >"$d/harness-help" 2>/dev/null || exit 1
+cmp -s "$d/vendor-help" "$d/harness-help" || exit 1
+"$vendor" --definitely-not-a-real-kimi-option </dev/null >/dev/null 2>"$d/vendor-refusal"; [ $? -eq 1 ] || exit 1
+"{bin}/kimi-alab" --alab-no-update --definitely-not-a-real-kimi-option </dev/null >/dev/null 2>"$d/harness-refusal"; [ $? -eq 1 ] || exit 1
+cmp -s "$d/vendor-refusal" "$d/harness-refusal"
+''']
+within-secs = 120
 
 [package]
 name = "kimi-alab"
@@ -35,12 +124,19 @@ name = "kimi-alab"
 path = "src/main.rs"
 
 [dependencies]
+# The shared aterm client (alab-harness, crate alab-wire): the vendored copy of alab-harness
+# v0.1.0 under vendor/alab-harness, pinned by its git tree id in vendor/alab-harness.pin
+# (alab-harness tools/pin; run it again with a newer tag and commit to move). tests/pin.rs
+# holds the committed copy to the pin.
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire" }
 libc = "0.2"
-rustix = { version = "1", features = ["fs", "process", "param", "system", "termios"] }
+rustix = { version = "1", features = ["fs", "process", "param", "system", "termios", "time"] }
 signal-hook = { version = "0.4", default-features = false }
 serde_json = "1"
 
 [dev-dependencies]
+# The fake aterm the integration tests run the harness against, from the same vendored v0.1.0.
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire", features = ["fake"] }
 rustix = { version = "1", features = ["process", "pty", "fs"] }
 
 [lints.rust]

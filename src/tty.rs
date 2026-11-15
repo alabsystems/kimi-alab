@@ -17,7 +17,9 @@ use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::process::getpgrp;
-use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetpgrp, tcsetattr};
+use rustix::termios::{
+    OptionalActions, QueueSelector, Termios, tcflush, tcgetattr, tcgetpgrp, tcsetattr,
+};
 
 /// The terminal's modes when the harness started, restored before a relaunch or after a
 /// signal death while the harness's group owns the terminal.
@@ -34,10 +36,48 @@ impl Modes {
         let Some(t) = &self.0 else {
             return;
         };
-        let stdin = std::io::stdin();
-        if tcgetpgrp(&stdin).is_ok_and(|group| group == getpgrp()) {
-            let _ = tcsetattr(&stdin, OptionalActions::Now, t);
+        if foreground() {
+            let _ = tcsetattr(std::io::stdin(), OptionalActions::Now, t);
         }
+    }
+}
+
+/// Whether this process's group is the foreground group of standard input's terminal.
+fn foreground() -> bool {
+    tcgetpgrp(std::io::stdin()).is_ok_and(|group| group == getpgrp())
+}
+
+/// The terminal's keyboard, mouse and paste reporting back to plain, on both screens, written
+/// after a child died without undoing its own. Under the kitty keyboard protocol or
+/// `modifyOtherKeys` a terminal encodes Ctrl-C as an escape sequence, never the byte the line
+/// discipline turns into `SIGINT`, so restoring the line modes alone would leave a dead screen
+/// that no key can end. A relaunched child pushes its own modes again.
+const PLAIN_KEYBOARD: &[u8] = b"\x1b[=0u\x1b[<99u\x1b[?1049l\x1b[=0u\x1b[<99u\x1b[>4m\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?25h";
+
+/// Write [`PLAIN_KEYBOARD`] to the terminal the child drew on, best effort, and only while this
+/// process's group owns it.
+pub fn release_keyboard() {
+    use std::io::Write;
+    if !foreground() {
+        return;
+    }
+    let wrote = if std::io::stdout().is_terminal() {
+        let mut out = std::io::stdout();
+        out.write_all(PLAIN_KEYBOARD).and_then(|()| out.flush())
+    } else if std::io::stderr().is_terminal() {
+        std::io::stderr().write_all(PLAIN_KEYBOARD)
+    } else {
+        Ok(())
+    };
+    let _ = wrote;
+}
+
+/// Drop what was typed on the terminal and not yet read, while this process's group owns it:
+/// keys typed at a dead screen are meant for no shell and no relaunched child.
+pub fn discard_input() {
+    if foreground() {
+        let _ = tcflush(std::io::stdin(), QueueSelector::IFlush);
     }
 }
 

@@ -14,17 +14,30 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use alab_wire::Scope;
+use alab_wire::fake::{FakeAterm, POLICY_ON};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 const HARNESS: &str = env!("CARGO_BIN_EXE_kimi-alab");
 const BUILD_A: u64 = 1_000_002_000_003_000_001; // 2.3.1
 const BUILD_B: u64 = 1_000_002_000_003_000_002; // 2.3.2
 const BUILD_C: u64 = 1_000_002_000_003_000_003; // 2.3.3
+
+/// The harness's poll period in these tests (`KIMI_ALAB_POLL_MS`).
+const POLL_MS: u64 = 50;
+/// The safe point's quiet window in these tests (`KIMI_ALAB_QUIET_MS`).
+const QUIET_MS: u64 = 400;
+/// The SIGTERM grace a test that abandons a move gives a deaf child (`KIMI_ALAB_TERM_GRACE_MS`).
+const TERM_GRACE_MS: u64 = 300;
+/// The ceiling for anything the harness does as soon as it can. A test that passes returns the
+/// moment its condition holds, so this costs nothing there; it is generous because a loaded
+/// machine can leave the harness unscheduled for seconds.
+const DEADLINE: Duration = Duration::from_secs(30);
 
 /// A store `kimi` that leads back to the harness: it records its depth, then runs `$HARNESS_BIN`
 /// (`exec`ing it, or as a child, per `@RUN@`). It stops by itself at `$CHAIN_CAP` with exit 42,
@@ -40,11 +53,14 @@ CHAIN_DEPTH=$((n + 1)); export CHAIN_DEPTH
 /// The fake vendor CLI: records how it was run, then behaves as `FAKE_MODE` says. In the
 /// default `session` mode it holds a Kimi session lock (as kimi 2.3.1's `SessionLockService`
 /// writes one) and idles until a signal, ending 143 on SIGTERM and 129 on SIGHUP as Kimi does.
+/// In `crash` mode its first run, and in `crashloop` mode every run, crashes once the test lets
+/// it ([`Lab::let_run_crash`]): the test waits for what the crash needs instead of a timer.
 const FAKE: &str = r#"#!/bin/sh
 label='@LABEL@'
 rec="$FAKE_REC"
 ev="$rec/$label.events"
 { printf '%s' "$label"; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$rec/argv"
+run=$(($(wc -l < "$rec/argv")))
 echo "auto_update=${KIMI_CODE_NO_AUTO_UPDATE-unset} shim=${FAKE_SHIM-unset}" > "$rec/$label.env"
 printf 'home=%s model=%s key=%s headers=%s\n' "${KIMI_CODE_HOME-default}" "${KIMI_MODEL_NAME+set}" "${KIMI_MODEL_API_KEY+set}" "${KIMI_CODE_CUSTOM_HEADERS+set}" >> "$rec/$label.account"
 ulimit -c 0
@@ -67,19 +83,18 @@ if [ "${FAKE_SESSION:-sess-1}" != none ]; then
   mv "$lock.tmp" "$lock"
 fi
 if [ -n "$FAKE_READ" ]; then exec 3<&0; cat <&3 > /dev/null & fi
-sleep 3600 & spid=$!
-echo "$$" > "$rec/$label.pid.tmp"; mv "$rec/$label.pid.tmp" "$rec/$label.pid"
 if [ -e "$rec/background-work" ]; then
-  sh -c 'while [ ! -e "$1" ]; do sleep 1; done' sh "$rec/stop-background" & workpid=$!
+  # A shell that starts no process of its own while it waits, so the tree stays the same.
+  mkfifo "$rec/background.fifo"
+  sh -c 'read x < "$1"' sh "$rec/background.fifo" & workpid=$!
 fi
-if [ "${FAKE_MODE:-session}" = crash ] && [ ! -e "$rec/crashed" ]; then
-  : > "$rec/crashed"
+sleep 3600 & spid=$!
+# Every process of the idle tree runs before the pid is published; from here on only builtins
+# run, apart from a crash's own wait.
+echo "$$" > "$rec/$label.pid.tmp"; mv "$rec/$label.pid.tmp" "$rec/$label.pid"
+if { [ "${FAKE_MODE:-session}" = crash ] && [ "$run" = 1 ]; } || [ "${FAKE_MODE:-session}" = crashloop ]; then
+  while [ ! -e "$rec/crash-$run" ]; do sleep 0.05; done
   if [ -e "$rec/unlock-before-crash" ]; then rm -f "$lock"; lock=; fi
-  sleep 1
-  kill -"${FAKE_SIG:-SEGV}" $$
-fi
-if [ "${FAKE_MODE:-session}" = crashloop ]; then
-  sleep 1
   kill -"${FAKE_SIG:-SEGV}" $$
 fi
 if [ -n "$FAKE_BURN" ]; then while [ ! -e "$rec/stop-burn" ]; do :; done; fi
@@ -105,144 +120,33 @@ struct Pty {
     seen: Arc<Mutex<Vec<u8>>>,
 }
 
-struct FakeAterm {
-    runtime: PathBuf,
-    claims: Arc<Mutex<Vec<String>>>,
-    sock: PathBuf,
-    token: PathBuf,
-    restart_tx: std::sync::mpsc::Sender<String>,
+/// A fake aterm (alab-wire's, feature `fake`) laid for this harness: kimi-alab's roster row, the
+/// policy in effect serving contracts 2, 3 and 4, a quiet session, and no claim. A scenario
+/// changes it while the harness runs.
+fn fake_aterm(name: &str) -> FakeAterm {
+    FakeAterm::for_harness(name, &kimi_alab::aterm::config())
 }
 
-impl FakeAterm {
-    fn restart(&self) {
-        self.restart_tx
-            .send("restart cause=asked".to_string())
-            .unwrap();
-    }
+/// What aterm answers a read while it shows a dialog: it cannot say now, and asks to be asked
+/// again.
+const DIALOG_ERR: &str = "ERR aterm is showing a dialog; answer it, then retry";
 
-    fn restart_account(&self, home: &Path) {
-        let home = home
-            .to_string_lossy()
-            .replace('%', "%25")
-            .replace('/', "%2F")
-            .replace(' ', "%20");
-        self.restart_tx
-            .send(format!("restart cause=account to=work home={home}"))
-            .unwrap();
-    }
+/// Every claim the harness sent (`meta set supervisor …`), in order, without its `@<sid> `.
+fn claims(aterm: &FakeAterm) -> Vec<String> {
+    aterm
+        .verbs()
+        .into_iter()
+        .filter(|verb| verb.starts_with("meta set supervisor "))
+        .collect()
 }
 
-impl Drop for FakeAterm {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.sock);
-        let _ = std::fs::remove_file(&self.token);
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn fake_aterm(root: &Path, sid: &str) -> FakeAterm {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
-
-    let runtime = root.join("aterm");
-    std::fs::create_dir_all(runtime.join("graph")).unwrap();
-    let sock = std::env::temp_dir().join(format!(
-        "ka-{}-{}.sock",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::SeqCst)
-    ));
-    let token = sock.with_file_name(format!(
-        "{}.token",
-        sock.file_name().unwrap().to_string_lossy()
-    ));
-    std::fs::write(&token, "test-token\n").unwrap();
-    std::fs::write(
-        runtime.join("graph").join(sid),
-        format!("sock {}\n", sock.display()),
-    )
-    .unwrap();
-    let listener = UnixListener::bind(&sock).unwrap();
-    let claims = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&claims);
-    let sid = sid.to_string();
-    let (restart_tx, restart_rx) = std::sync::mpsc::channel();
-    let restart_rx = std::sync::Arc::new(Mutex::new(Some(restart_rx)));
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else {
-                break;
-            };
-            let recorded = Arc::clone(&recorded);
-            let sid = sid.clone();
-            let restart_rx = Arc::clone(&restart_rx);
-            std::thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut writer = stream;
-                let mut supervisor = String::from("kimi-alab@0");
-                let mut lines = String::new();
-                loop {
-                    lines.clear();
-                    let Ok(read) = reader.read_line(&mut lines) else {
-                        break;
-                    };
-                    if read == 0 {
-                        break;
-                    }
-                    let line = lines.trim_end();
-                    if line.starts_with("AUTH ") {
-                        assert_eq!(line, "AUTH test-token");
-                        continue;
-                    }
-                    if line == format!("subscribe @{sid} events") {
-                        if writeln!(writer, "OK subscribe 1\nsub @{sid} events").is_err() {
-                            break;
-                        }
-                        if let Some(rx) = restart_rx.lock().unwrap().take() {
-                            let Ok(event) = rx.recv() else {
-                                break;
-                            };
-                            if writeln!(writer, "EVENT {sid} {event}").is_err() {
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    let reply = if line == "version" {
-                        "OK fake-aterm".to_string()
-                    } else if line == format!("@{sid} harness policy") {
-                        "OK gen=1 effective=on why=enabled contract=2,3 relaunch=true upgrade=true upgrade_ask=false human_grace_s=0".to_string()
-                    } else if let Some(claim) =
-                        line.strip_prefix(&format!("@{sid} meta set supervisor "))
-                    {
-                        supervisor = claim
-                            .split(" contract=3 ")
-                            .next()
-                            .unwrap_or("kimi-alab@0")
-                            .to_string();
-                        recorded.lock().unwrap().push(claim.to_string());
-                        assert!(claim.contains(" scope=relaunch,upgrade "), "{claim}");
-                        "OK".to_string()
-                    } else if line == format!("@{sid} status") {
-                        format!(
-                            "OK schema=1 supervisor={supervisor} supervisor_proven=1 agent=idle composer=empty human_ms=- hand=- hold=0 input=clear need=-"
-                        )
-                    } else {
-                        "ERR unexpected verb".to_string()
-                    };
-                    if writeln!(writer, "{reply}").is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    FakeAterm {
-        runtime,
-        claims,
-        sock,
-        token,
-        restart_tx,
-    }
+/// How many `harness policy` reads aterm was asked for.
+fn policy_reads(aterm: &FakeAterm) -> usize {
+    aterm
+        .verbs()
+        .iter()
+        .filter(|verb| *verb == "harness policy")
+        .count()
 }
 
 impl Lab {
@@ -367,8 +271,8 @@ impl Lab {
             .env("KIMI_ALAB_PKG_PREFIX", self.prefix())
             .env("KIMI_ALAB_JOURNAL", self.root.join("journal.log"))
             .env("KIMI_CODE_HOME", self.root.join("kimi-home"))
-            .env("KIMI_ALAB_POLL_MS", "50")
-            .env("KIMI_ALAB_QUIET_MS", "400")
+            .env("KIMI_ALAB_POLL_MS", POLL_MS.to_string())
+            .env("KIMI_ALAB_QUIET_MS", QUIET_MS.to_string())
             .env("KIMI_ALAB_ATTEST_MS", "15000")
             .env("FAKE_REC", self.rec())
             .process_group(0);
@@ -443,10 +347,9 @@ impl Lab {
             .unwrap_or_default()
     }
 
-    fn type_keys(&mut self, keys: &[u8]) {
-        if let Some(p) = self.pty.as_mut() {
-            let _ = p.writer.write_all(keys);
-        }
+    /// The terminal's keyboard: what is written here is typed on the pty.
+    fn keyboard(&self) -> File {
+        self.pty.as_ref().unwrap().writer.try_clone().unwrap()
     }
 
     fn pid_of(&self, label: &str) -> Option<Pid> {
@@ -486,7 +389,7 @@ impl Lab {
         self.make_current(BUILD_A);
         let child = self.spawn_on_pty_with(args, fake, stderr);
         assert!(
-            wait_for(Duration::from_secs(10), || self.pid_of("A").is_some()),
+            wait_for(DEADLINE, || self.pid_of("A").is_some()),
             "A never started"
         );
         child
@@ -497,13 +400,81 @@ impl Lab {
         self.lay(BUILD_B, "B", "2.3.2");
         self.make_current(BUILD_B);
         assert!(
-            wait_for(Duration::from_secs(10), || self
-                .journal()
-                .contains("UPDATE ")),
+            wait_for(DEADLINE, || self.journal().contains("UPDATE ")),
             "the harness never saw the update; journal:\n{}",
             self.journal()
         );
     }
+
+    /// How many journal lines are `event` notes.
+    fn notes(&self, event: &str) -> usize {
+        let event = format!(" {event} ");
+        self.journal()
+            .lines()
+            .filter(|l| l.contains(&event))
+            .count()
+    }
+
+    /// Let run `run` (counted from 1) of a `crash` or `crashloop` fake crash, once the harness
+    /// has read that run's session lock: a crash before it has no conversation to resume.
+    fn let_run_crash(&self, run: usize) {
+        assert!(
+            wait_for(DEADLINE, || self.notes("SESSION") >= run),
+            "the harness never read run {run}'s session; journal:\n{}",
+            self.journal()
+        );
+        std::fs::write(self.rec().join(format!("crash-{run}")), "").unwrap();
+    }
+
+    /// Wait until the harness, `child`, has finished a whole pass of its loop that did its work
+    /// after this call. The harness takes a `SIGINT` while a child runs at the top of a pass and
+    /// journals it there as `IGNORED`, ahead of that pass's decisions; a second one, sent only
+    /// once the first is journalled, is taken at the top of a later pass, which starts only
+    /// when the first has ended. Every decision of the first pass is journalled by then.
+    fn pass(&self, child: &mut Child) {
+        self.ignored_sigint(child);
+        self.ignored_sigint(child);
+    }
+
+    /// Let `window` of the harness's own clock go by with the harness running, for an absence:
+    /// a whole pass first, so a timer a wrong decision would start has started; then `window`;
+    /// then a whole pass that decides with at least `window` gone since. What that decision
+    /// would journal is in the journal when this returns, however loaded the machine.
+    fn pass_after(&self, child: &mut Child, window: Duration) {
+        self.pass(child);
+        sleep(window);
+        self.pass(child);
+    }
+
+    /// Send the harness a `SIGINT` and wait until a pass of its loop has taken it.
+    fn ignored_sigint(&self, child: &mut Child) {
+        let before = self.notes("IGNORED");
+        signal(child, Signal::INT);
+        assert!(
+            wait_for(DEADLINE, || self.notes("IGNORED") > before),
+            "the harness never took its SIGINT (status {:?}); journal:\n{}",
+            child.try_wait().unwrap(),
+            self.journal()
+        );
+    }
+}
+
+/// The milliseconds since the epoch the journal stamped on its first `event` note matching
+/// `detail`.
+fn stamp(journal: &str, event: &str, detail: &str) -> Option<u128> {
+    let event = format!(" {event} ");
+    journal
+        .lines()
+        .find(|l| l.contains(&event) && l.contains(detail))
+        .and_then(|l| l.split(' ').next())
+        .and_then(|ms| ms.parse().ok())
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
 
 impl Drop for Lab {
@@ -562,7 +533,7 @@ fn stderr_of(child: &mut Child) -> String {
 fn refuses_when_the_vendor_is_missing() {
     let mut lab = Lab::new("missing");
     let mut child = lab.spawn(&["--yolo"], &[]);
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     let err = stderr_of(&mut child);
     assert_eq!(st.code(), Some(127), "stderr: {err}");
     assert!(err.contains("not installed in the atpkg store"), "{err}");
@@ -630,7 +601,7 @@ fn passes_every_argument_through_and_exits_with_the_childs_code() {
         &["--yolo", "a b", "", "--alab-which", "-V"],
         &[("FAKE_MODE", "exit"), ("FAKE_EXIT", "7")],
     );
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     assert_eq!(st.code(), Some(7), "stderr: {}", stderr_of(&mut child));
     assert_eq!(lab.argv(), "A [--yolo] [a b] [] [--alab-which] [-V]\n");
     let env = std::fs::read_to_string(lab.rec().join("A.env")).unwrap();
@@ -650,7 +621,7 @@ fn atpkg_run_envelope_passes_vendor_arguments_verbatim() {
         &["run", "--", "--version", "a b", "", "--alab-which"],
         &[("FAKE_MODE", "exit"), ("FAKE_EXIT", "0")],
     );
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     assert!(st.success(), "stderr: {}", stderr_of(&mut child));
     assert_eq!(lab.argv(), "A [--version] [a b] [] [--alab-which]\n");
 }
@@ -661,7 +632,7 @@ fn dies_by_the_signal_that_killed_the_child() {
     lab.lay(BUILD_A, "A", "2.3.1");
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&[], &[("FAKE_MODE", "selfkill"), ("FAKE_SIG", "SEGV")]);
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     assert_eq!(
         st.signal(),
         Some(11),
@@ -681,26 +652,35 @@ fn int_is_ignored_and_term_is_passed_on() {
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&[], &[]);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("A").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("A").is_some()),
         "A never started"
     );
     signal(&child, Signal::INT);
     signal(&child, Signal::QUIT);
-    sleep(Duration::from_millis(400));
+    // The harness journals each signal it keeps from the child on the pass that takes it.
+    assert!(
+        wait_for(DEADLINE, || {
+            let j = lab.journal();
+            j.contains("IGNORED signal 2 ") && j.contains("IGNORED signal 3 ")
+        }),
+        "the harness never took SIGINT and SIGQUIT; journal:\n{}",
+        lab.journal()
+    );
     assert!(
         child.try_wait().unwrap().is_none(),
         "SIGINT/SIGQUIT to the harness ended it"
     );
-    assert!(
-        !lab.events("A").contains("int"),
-        "the harness forwarded SIGINT, which belongs to the child"
-    );
     signal(&child, Signal::TERM);
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     assert_eq!(st.code(), Some(143), "the child's own status after SIGTERM");
+    let events = lab.events("A");
+    assert!(events.contains("term"), "SIGTERM never reached the child");
+    // An absence, looked for once A has ended: had the harness passed SIGINT on, it did so
+    // before the SIGTERM, and A's shell runs a pending INT trap before its TERM trap, whose
+    // exit ends it; so a forwarded SIGINT is in A's events by now, however late A ran.
     assert!(
-        lab.events("A").contains("term"),
-        "SIGTERM never reached the child"
+        !events.contains("int"),
+        "the harness forwarded SIGINT, which belongs to the child; events:\n{events}"
     );
     assert!(!lab.lock_exists(), "the child did not end its session");
 }
@@ -712,11 +692,11 @@ fn hup_is_passed_on() {
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&[], &[]);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("A").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("A").is_some()),
         "A never started"
     );
     signal(&child, Signal::HUP);
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     assert_eq!(st.code(), Some(129));
     assert!(lab.events("A").contains("hup"));
 }
@@ -736,7 +716,7 @@ fn a_child_that_stops_stops_the_harness_and_continue_resumes_both() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     assert!(
-        wait_for(Duration::from_secs(10), || state(harness).starts_with('T')),
+        wait_for(DEADLINE, || state(harness).starts_with('T')),
         "the harness did not stop with its child (state {:?}); journal:\n{}",
         state(harness),
         lab.journal()
@@ -744,7 +724,7 @@ fn a_child_that_stops_stops_the_harness_and_continue_resumes_both() {
     assert!(child.try_wait().unwrap().is_none());
     // As a shell's `fg` does: continue the whole job.
     kill_process_group(harness, Signal::CONT).unwrap();
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     assert_eq!(st.code(), Some(5));
     assert!(lab.events("A").contains("continued"));
 }
@@ -758,7 +738,7 @@ fn moves_onto_a_new_build_after_the_session_lock_disappears() {
     std::fs::remove_file(lab.root.join("kimi-home/locks/sessions/sess-1.lock")).unwrap();
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("B").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("B").is_some()),
         "never moved to B; journal:\n{}",
         lab.journal()
     );
@@ -776,16 +756,22 @@ fn moves_onto_a_new_build_after_the_session_lock_disappears() {
     );
     assert_eq!(Pid::from_child(&child), harness);
     assert!(
-        wait_for(Duration::from_secs(5), || lab
+        wait_for(DEADLINE, || lab
             .screen()
             .contains("resuming session sess-1")),
         "screen: {:?}",
         lab.screen()
     );
-    let j = lab.journal();
-    for event in ["START", "UPDATE", "ATTEST", "MOVE", "RELAUNCHED"] {
-        assert!(j.contains(event), "no {event} in the journal:\n{j}");
-    }
+    // B can start, and say so, before the harness journals that it started it.
+    let events = ["START", "UPDATE", "ATTEST", "MOVE", "RELAUNCHED"];
+    assert!(
+        wait_for(DEADLINE, || {
+            let j = lab.journal();
+            events.iter().all(|event| j.contains(event))
+        }),
+        "not all of {events:?} in the journal:\n{}",
+        lab.journal()
+    );
     assert_eq!(
         std::fs::read_to_string(lab.rec().join("B.env"))
             .unwrap()
@@ -793,37 +779,38 @@ fn moves_onto_a_new_build_after_the_session_lock_disappears() {
         "auto_update=1 shim=on"
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
+/// The fake aterm's session variables with `extra` after them, as the lab's spawn takes them.
+fn vars<'a>(
+    aterm: &'a [(String, String)],
+    extra: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    aterm
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .chain(extra.iter().copied())
+        .collect()
+}
+
+/// The launch claims at contract 4 (the highest aterm serves), before the child starts, and
+/// names the child once it runs; aterm attests a safe point and the move announces the new
+/// vendor build with the new child.
 #[test]
 fn aterm_attests_and_reclaims_an_automatic_move() {
     let mut lab = Lab::new("aterm-move");
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let runtime = &aterm.runtime;
-    let claims = &aterm.claims;
-    assert!(runtime.join("graph/s-beef").is_file());
-    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
-    let mut child = lab.running_a_on_pty(
-        &["--skills-dir", "/sk"],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-        ],
-    );
+    let aterm = fake_aterm("aterm-move");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&["--skills-dir", "/sk"], &vars(&env, &[]));
     assert!(
-        wait_for(Duration::from_secs(10), || claims.lock().unwrap().len()
-            == 1),
-        "aterm never proved the initial claim; journal:\n{}",
+        wait_for(DEADLINE, || claims(&aterm).len() == 2),
+        "aterm never proved the claim and its child; journal:\n{}",
         lab.journal()
     );
     lab.install_b();
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("B").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("B").is_some()),
         "aterm's attestation never moved B; journal:\n{}",
         lab.journal()
     );
@@ -832,47 +819,86 @@ fn aterm_attests_and_reclaims_an_automatic_move() {
         "A [--skills-dir] [/sk]\nB [--skills-dir] [/sk] [--session] [sess-1]\n"
     );
     assert!(
-        wait_for(Duration::from_secs(5), || claims.lock().unwrap().len() == 2),
+        wait_for(DEADLINE, || claims(&aterm).len() == 3),
         "the new vendor was not announced: {:?}",
-        claims.lock().unwrap()
+        claims(&aterm)
     );
-    let claims = claims.lock().unwrap();
+    let claims = claims(&aterm);
+    let version = format!(
+        " contract=4 scope=relaunch,upgrade version={} vendor=",
+        kimi_alab::cli::VERSION
+    );
     assert!(
-        claims[0].contains(format!("version={} vendor=2.3.1", kimi_alab::cli::VERSION).as_str()),
+        claims.iter().all(|claim| claim.contains(&version)),
+        "{claims:?}"
+    );
+    // The launch's claim names no child: none runs yet. Each start names its own.
+    assert!(claims[0].ends_with(" vendor=2.3.1"), "{claims:?}");
+    let a = lab.pid_of("A").unwrap().as_raw_nonzero();
+    let b = lab.pid_of("B").unwrap().as_raw_nonzero();
+    assert!(
+        claims[1].contains(&format!(" vendor=2.3.1 child={a}:")),
         "{claims:?}"
     );
     assert!(
-        claims[1].contains(format!("version={} vendor=2.3.2", kimi_alab::cli::VERSION).as_str()),
+        claims[2].contains(&format!(" vendor=2.3.2 child={b}:")),
         "{claims:?}"
     );
-    drop(claims);
+    assert!(
+        lab.journal().contains("CLAIMED holder=kimi-alab@")
+            && lab
+                .journal()
+                .contains(" contract=4 scope=relaunch,upgrade "),
+        "journal:\n{}",
+        lab.journal()
+    );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// Against an aterm from before contract 4, the claim is contract 3's, made only after the
+/// roster guard finds the harness's row.
+#[test]
+fn against_an_aterm_without_contract_4_the_claim_is_contract_3s() {
+    let mut lab = Lab::new("aterm-three");
+    let aterm = fake_aterm("aterm-three");
+    aterm.serve_contracts(&[2, 3]);
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert!(
+        wait_for(DEADLINE, || claims(&aterm).len() == 2),
+        "aterm never proved the claim; journal:\n{}",
+        lab.journal()
     );
+    let verbs = aterm.verbs();
+    let roster = verbs.iter().position(|verb| verb == "native-act info");
+    let claimed = verbs
+        .iter()
+        .position(|verb| verb.starts_with("meta set supervisor "));
+    assert!(roster.is_some() && roster < claimed, "{verbs:?}");
+    for claim in claims(&aterm) {
+        assert!(
+            claim.contains(" contract=3 scope=relaunch,upgrade ") && !claim.contains(" child="),
+            "{claim}"
+        );
+    }
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
 fn aterm_relaunches_a_crashed_child_on_the_same_session() {
     let mut lab = Lab::new("cr");
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let runtime = &aterm.runtime;
-    let claims = &aterm.claims;
-    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let aterm = fake_aterm("cr");
+    let env = aterm.env();
     let mut child = lab.running_a_on_pty(
         &["--skills-dir", "/sk"],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-            ("FAKE_MODE", "crash"),
-            ("FAKE_SIG", "KILL"),
-        ],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
     );
     let first = lab.pid_of("A").unwrap();
+    lab.let_run_crash(1);
     assert!(
-        wait_for(Duration::from_secs(10), || {
+        wait_for(DEADLINE, || {
             lab.pid_of("A").is_some_and(|pid| pid != first)
         }),
         "the crash was not relaunched; journal:\n{}",
@@ -884,34 +910,30 @@ fn aterm_relaunches_a_crashed_child_on_the_same_session() {
         "A [--skills-dir] [/sk]\nA [--skills-dir] [/sk] [--session] [sess-1]\n"
     );
     assert!(lab.journal().contains("CRASH-RELAUNCH"));
-    assert_eq!(claims.lock().unwrap().len(), 2);
-    signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
+    // The relaunched child can run before the harness announces it.
+    assert!(
+        wait_for(DEADLINE, || claims(&aterm).len() == 3),
+        "{:?}",
+        claims(&aterm)
     );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
 fn aterm_relaunches_after_the_session_lock_disappears_before_a_crash() {
     let mut lab = Lab::new("cr-unlock");
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let runtime = &aterm.runtime;
-    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+    let aterm = fake_aterm("cr-unlock");
+    let env = aterm.env();
     let mut child = lab.running_a_on_pty(
         &[],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-            ("FAKE_MODE", "crash"),
-            ("FAKE_SIG", "KILL"),
-        ],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
     );
     let first = lab.pid_of("A").unwrap();
     std::fs::write(lab.rec().join("unlock-before-crash"), "").unwrap();
+    lab.let_run_crash(1);
     assert!(
-        wait_for(Duration::from_secs(10), || {
+        wait_for(DEADLINE, || {
             lab.pid_of("A").is_some_and(|pid| pid != first)
         }),
         "the crash was not relaunched after the lock disappeared; journal:\n{}",
@@ -920,32 +942,26 @@ fn aterm_relaunches_after_the_session_lock_disappears_before_a_crash() {
     assert!(child.try_wait().unwrap().is_none());
     assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
     assert!(lab.journal().contains("CRASH-RELAUNCH"));
-    assert_eq!(aterm.claims.lock().unwrap().len(), 2);
-    signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
+    // The relaunched child can run before the harness announces it.
+    assert!(
+        wait_for(DEADLINE, || claims(&aterm).len() == 3),
+        "{:?}",
+        claims(&aterm)
     );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
 fn aterm_restart_event_restarts_the_same_session() {
     let mut lab = Lab::new("rs");
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let runtime = &aterm.runtime;
-    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
-    let mut child = lab.running_a_on_pty(
-        &["--skills-dir", "/sk"],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-        ],
-    );
+    let aterm = fake_aterm("rs");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&["--skills-dir", "/sk"], &vars(&env, &[]));
     let first = lab.pid_of("A").unwrap();
-    aterm.restart();
+    aterm.send_restart("asked");
     assert!(
-        wait_for(Duration::from_secs(10), || {
+        wait_for(DEADLINE, || {
             lab.pid_of("A").is_some_and(|pid| pid != first)
         }),
         "the restart event did not restart A; journal:\n{}",
@@ -958,38 +974,68 @@ fn aterm_restart_event_restarts_the_same_session() {
     );
     assert!(lab.journal().contains("RESTART cause=asked"));
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
+/// aterm names a model on a restart from HX-06 on. Starting Kimi Code on the model it ran would
+/// answer a model move with the model aterm moved it from, so until the harness can choose
+/// Kimi's model on a resume, the restart is refused and the child runs on.
 #[test]
-fn aterm_account_event_moves_home_and_drops_credential_overrides() {
-    let mut lab = Lab::new("account");
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let runtime = &aterm.runtime;
-    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
-    let mut child = lab.running_a_on_pty(
-        &["--skills-dir", "/sk"],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-            ("KIMI_MODEL_NAME", "other-account"),
-            ("KIMI_MODEL_API_KEY", "test-only-key"),
-            ("KIMI_CODE_CUSTOM_HEADERS", "Authorization: test-only"),
-        ],
-    );
+fn a_restart_naming_a_model_is_refused_and_the_child_runs_on() {
+    let mut lab = Lab::new("rs-model");
+    let aterm = fake_aterm("rs-model");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
     let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.send_model_restart("model", "kimi-k2-turbo");
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("RESTART-REFUSED cause=model model=kimi-k2-turbo")),
+        "the model restart was not refused; journal:\n{}",
+        lab.journal()
+    );
+    lab.pass(&mut child);
+    assert_eq!(lab.notes("RESTART"), 0, "journal:\n{}", lab.journal());
+    assert_eq!(lab.pid_of("A"), Some(first));
+    assert_eq!(lab.argv(), "A\n");
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// Lay an account home that shares the default home's sessions and locks, as aterm's pool
+/// overlay homes do.
+fn account_home(lab: &Lab) -> PathBuf {
     let target = lab.root.join("account home");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::create_dir_all(lab.root.join("kimi-home/sessions")).unwrap();
     symlink(lab.root.join("kimi-home/locks"), target.join("locks")).unwrap();
     symlink(lab.root.join("kimi-home/sessions"), target.join("sessions")).unwrap();
-    aterm.restart_account(&target);
+    target
+}
+
+#[test]
+fn aterm_account_event_moves_home_and_drops_credential_overrides() {
+    let mut lab = Lab::new("account");
+    let aterm = fake_aterm("account");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &vars(
+            &env,
+            &[
+                ("KIMI_MODEL_NAME", "other-account"),
+                ("KIMI_MODEL_API_KEY", "test-only-key"),
+                ("KIMI_CODE_CUSTOM_HEADERS", "Authorization: test-only"),
+            ],
+        ),
+    );
+    let first = lab.pid_of("A").unwrap();
+    let target = account_home(&lab);
+    aterm.send_account_restart("account", "work", Some(&target));
     assert!(
-        wait_for(Duration::from_secs(10), || {
+        wait_for(DEADLINE, || {
             lab.pid_of("A").is_some_and(|pid| pid != first)
         }),
         "the account event did not restart A; journal:\n{}",
@@ -1012,19 +1058,16 @@ fn aterm_account_event_moves_home_and_drops_credential_overrides() {
         lab.journal()
             .contains("RESTART cause=account to=work: resuming session sess-1")
     );
+    // The restarted child can run before the harness announces its account.
     assert!(
-        aterm
-            .claims
-            .lock()
-            .unwrap()
+        wait_for(DEADLINE, || claims(&aterm)
             .last()
-            .is_some_and(|claim| claim.ends_with("login=work"))
+            .is_some_and(|claim| claim.ends_with("login=work"))),
+        "{:?}",
+        claims(&aterm)
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1032,32 +1075,16 @@ fn harness_reexec_keeps_the_child_pid_and_managed_account() {
     let mut lab = Lab::new("self-exec");
     lab.lay_own_image(1);
     lab.make_own_current(1);
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let xdg = aterm
-        .runtime
-        .parent()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let mut child = lab.running_a_on_pty(
-        &["--skills-dir", "/sk"],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-        ],
-    );
+    let aterm = fake_aterm("self-exec");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&["--skills-dir", "/sk"], &vars(&env, &[]));
     let first = lab.pid_of("A").unwrap();
-    let target = lab.root.join("account home");
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::create_dir_all(lab.root.join("kimi-home/sessions")).unwrap();
-    symlink(lab.root.join("kimi-home/locks"), target.join("locks")).unwrap();
-    symlink(lab.root.join("kimi-home/sessions"), target.join("sessions")).unwrap();
-    aterm.restart_account(&target);
+    assert!(wait_for(DEADLINE, || claims(&aterm).len() == 2));
+    let target = account_home(&lab);
+    aterm.send_account_restart("account", "work", Some(&target));
     assert!(
-        wait_for(Duration::from_secs(10), || {
-            lab.pid_of("A").is_some_and(|pid| pid != first)
-                && aterm.claims.lock().unwrap().len() == 2
+        wait_for(DEADLINE, || {
+            lab.pid_of("A").is_some_and(|pid| pid != first) && claims(&aterm).len() == 3
         }),
         "the account move did not finish; journal:\n{}",
         lab.journal()
@@ -1067,8 +1094,8 @@ fn harness_reexec_keeps_the_child_pid_and_managed_account() {
     lab.lay_own_image(2);
     lab.make_own_current(2);
     assert!(
-        wait_for(Duration::from_secs(10), || {
-            lab.journal().contains(" ADOPT ") && aterm.claims.lock().unwrap().len() == 3
+        wait_for(DEADLINE, || {
+            lab.journal().contains(" ADOPT ") && claims(&aterm).len() == 4
         }),
         "the new harness image did not adopt the child; journal:\n{}",
         lab.journal()
@@ -1088,19 +1115,15 @@ fn harness_reexec_keeps_the_child_pid_and_managed_account() {
             target.display()
         )
     );
+    // The new image's claim names the same child it adopted, on the same account.
+    let last = claims(&aterm).pop().unwrap();
     assert!(
-        aterm
-            .claims
-            .lock()
-            .unwrap()
-            .last()
-            .is_some_and(|claim| claim.ends_with("login=work"))
+        last.contains(&format!(" child={}:", preserved.as_raw_nonzero()))
+            && last.ends_with("login=work"),
+        "{last}"
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1113,56 +1136,660 @@ fn a_failed_harness_reexec_leaves_the_old_supervisor_and_child_alive() {
     let replacement = lab.lay_own_image(2);
     lab.make_own_current(2);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("SELF-UPDATE ")),
+        wait_for(DEADLINE, || lab.journal().contains("SELF-UPDATE ")),
         "the harness did not see its update; journal:\n{}",
         lab.journal()
     );
     std::fs::remove_file(replacement).unwrap();
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("REEXEC-FAILED")),
+        wait_for(DEADLINE, || lab.journal().contains("REEXEC-FAILED")),
         "the failed exec was not journaled; journal:\n{}",
         lab.journal()
     );
     assert!(child.try_wait().unwrap().is_none());
     assert_eq!(lab.pid_of("A"), Some(vendor));
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn a_crash_streak_climbs_the_ladder_and_a_signal_in_the_pause_ends_the_harness() {
+    let mut lab = Lab::new("ladder");
+    let aterm = fake_aterm("ladder");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[("FAKE_MODE", "crashloop")]));
+    lab.let_run_crash(1);
+    lab.let_run_crash(2);
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("streak=1 pause-ms=10000")),
+        "the second crash did not wait 10 s; journal:\n{}",
+        lab.journal()
+    );
+    assert!(lab.journal().contains("streak=0 pause-ms=1000"));
+    // The pause runs: nothing is started for its first seconds, and the harness waits on. The
+    // seconds count from when the harness journalled the pause, not from when this test saw
+    // it, so the look falls well inside the pause however late the test runs.
+    let pause = alab_wire::relaunch::BACKOFF[1];
+    let began = stamp(&lab.journal(), "CRASH", "streak=1 pause-ms=10000").unwrap();
+    let look = began + pause.as_millis() * 2 / 5;
+    while now_ms() < look {
+        sleep(Duration::from_millis(25));
+    }
+    // What is seen and sent here is judged only once it is known to lie inside the pause: a
+    // test thread that wakes after the third run began would see that run, not a fault.
+    let argv = lab.argv();
+    let running = child.try_wait().unwrap().is_none();
+    // Ctrl-C while no child runs ends the harness the way the child ended.
+    signal(&child, Signal::INT);
+    let end = began + pause.as_millis() - u128::from(POLL_MS);
+    assert!(
+        now_ms() < end,
+        "the test ran past the pause, so it could not look inside it; journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(argv, "A\nA [--session] [sess-1]\n");
+    assert!(running);
+    let status = wait_exit(&mut child, DEADLINE);
+    assert_eq!(status.signal(), Some(11), "status: {status:?}");
+    assert!(
+        lab.journal().contains("CRASH-PASSED-ON signal 2"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
+}
+
+#[test]
+fn a_crash_just_after_a_person_typed_is_theirs_and_is_not_relaunched() {
+    let mut lab = Lab::new("cr-person");
+    let aterm = fake_aterm("cr-person");
+    aterm.set_status("human_ms", Some("500"));
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
+    );
+    lab.let_run_crash(1);
+    let status = wait_exit(&mut child, DEADLINE);
+    assert_eq!(status.signal(), Some(9), "status: {status:?}");
+    assert_eq!(lab.argv(), "A\n");
+    assert!(
+        lab.journal()
+            .contains("CRASH-PASSED-ON person human_ms=500"),
+        "journal:\n{}",
+        lab.journal()
     );
 }
 
 #[test]
-fn a_second_crash_inside_startup_grace_does_not_loop() {
-    let mut lab = Lab::new("cl");
-    let aterm = fake_aterm(&lab.root, "s-beef");
-    let runtime = &aterm.runtime;
-    let xdg = runtime.parent().unwrap().to_string_lossy().into_owned();
+fn a_crash_while_aterm_answers_err_waits_and_is_relaunched() {
+    let mut lab = Lab::new("cr-err");
+    let aterm = fake_aterm("cr-err");
+    let env = aterm.env();
     let mut child = lab.running_a_on_pty(
         &[],
-        &[
-            ("TERM_PROGRAM", "aterm"),
-            ("ATERM_PARENT_SESSION_ID", "s-beef"),
-            ("XDG_RUNTIME_DIR", &xdg),
-            ("FAKE_MODE", "crashloop"),
-        ],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
     );
     let first = lab.pid_of("A").unwrap();
+    // A dialog comes up in aterm before the crash: its policy reads answer `ERR` until it goes.
+    aterm.set_policy_reply(DIALOG_ERR);
+    lab.let_run_crash(1);
     assert!(
-        wait_for(Duration::from_secs(10), || {
-            lab.pid_of("A").is_some_and(|pid| pid != first)
-        }),
-        "the first crash was not relaunched; journal:\n{}",
+        wait_for(DEADLINE, || lab.journal().contains("CRASH-WAIT")),
+        "the crash did not wait for aterm; journal:\n{}",
         lab.journal()
     );
-    let status = wait_exit(&mut child, Duration::from_secs(10));
-    assert_eq!(status.signal(), Some(11), "status: {status:?}");
+    assert_eq!(lab.argv(), "A\n");
+    aterm.clear_policy_reply();
+    assert!(
+        wait_for(DEADLINE, || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the crash was not relaunched once aterm answered; journal:\n{}",
+        lab.journal()
+    );
     assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
+    assert!(child.try_wait().unwrap().is_none());
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn a_signal_while_the_crash_waits_for_aterm_ends_the_harness_as_the_child_ended() {
+    let mut lab = Lab::new("cr-wait-sig");
+    let aterm = fake_aterm("cr-wait-sig");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &vars(&env, &[("FAKE_MODE", "crash"), ("FAKE_SIG", "KILL")]),
+    );
+    aterm.set_policy_reply(DIALOG_ERR);
+    lab.let_run_crash(1);
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains("CRASH-WAIT")),
+        "the crash did not wait for aterm; journal:\n{}",
+        lab.journal()
+    );
+    // The harness asks aterm again, is answered `ERR` again, and waits on.
+    let asked = policy_reads(&aterm);
+    assert!(
+        wait_for(DEADLINE, || policy_reads(&aterm) > asked
+            || child.try_wait().unwrap().is_some()),
+        "the harness never asked aterm again; journal:\n{}",
+        lab.journal()
+    );
+    assert!(child.try_wait().unwrap().is_none(), "{}", lab.journal());
+    signal(&child, Signal::QUIT);
+    let status = wait_exit(&mut child, DEADLINE);
+    assert_eq!(status.signal(), Some(9), "status: {status:?}");
+    assert!(lab.journal().contains("CRASH-PASSED-ON signal 3"));
+    assert_eq!(lab.argv(), "A\n");
+}
+
+#[test]
+fn an_asked_restart_is_refused_under_another_drivers_hand() {
+    let mut lab = Lab::new("rs-hand");
+    let aterm = fake_aterm("rs-hand");
+    aterm.set_status("hand", Some("lease:driver%404"));
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.send_restart("asked");
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains(
+            "RESTART-REFUSED cause=asked held hold=0 hand=lease:driver%25404"
+        )),
+        "the restart was not refused; journal:\n{}",
+        lab.journal()
+    );
+    // An absence: the refused restart is never made later. A restart that waits is asked about
+    // again a second after the pass that refused it; that and a whole pass go by, and the
+    // harness's decision, a `RESTART` line, is looked for.
+    lab.pass_after(
+        &mut child,
+        Duration::from_millis(alab_wire::link::LATER_RETRY_MS),
+    );
+    assert_eq!(lab.notes("RESTART"), 0, "journal:\n{}", lab.journal());
+    assert_eq!(lab.pid_of("A"), Some(first));
+    assert_eq!(lab.argv(), "A\n");
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn a_restart_while_aterm_answers_err_waits_and_is_made() {
+    let mut lab = Lab::new("rs-err");
+    let aterm = fake_aterm("rs-err");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.set_policy_reply(DIALOG_ERR);
+    aterm.send_restart("asked");
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("RESTART-WAITS cause=asked aterm did not answer")),
+        "the restart did not wait for aterm; journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(lab.pid_of("A"), Some(first));
+    aterm.clear_policy_reply();
+    assert!(
+        wait_for(DEADLINE, || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the restart was not made once aterm answered; journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn an_asked_restart_is_made_under_relaunch_false() {
+    let mut lab = Lab::new("rs-limited");
+    let aterm = fake_aterm("rs-limited");
+    aterm.set_policy(&POLICY_ON.replace("relaunch=true", "relaunch=false"));
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.send_restart("asked");
+    assert!(
+        wait_for(DEADLINE, || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the restart aterm asked for was not made; journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn a_restart_of_a_child_deaf_to_sigterm_is_killed_and_resumed() {
+    let mut lab = Lab::new("rs-deaf");
+    let aterm = fake_aterm("rs-deaf");
+    let env = aterm.env();
+    // The child's trap must run, and say it ignored the SIGTERM, before the SIGKILL ends it: a
+    // grace a loaded machine cannot outlast, though it is the whole cost of the test.
+    let mut child = lab.running_a_on_pty(
+        &["--skills-dir", "/sk"],
+        &vars(
+            &env,
+            &[
+                ("FAKE_IGNORE_TERM", "1"),
+                ("KIMI_ALAB_TERM_GRACE_MS", "3000"),
+            ],
+        ),
+    );
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.send_restart("stall");
+    assert!(
+        wait_for(DEADLINE, || {
+            lab.pid_of("A").is_some_and(|pid| pid != first)
+        }),
+        "the deaf child was not ended and resumed; journal:\n{}",
+        lab.journal()
+    );
+    assert!(lab.journal().contains("RESTART-KILL cause=stall"));
+    assert_eq!(
+        lab.events("A")
+            .lines()
+            .filter(|l| *l == "term-ignored")
+            .count(),
+        1
+    );
+    assert_eq!(
+        lab.argv(),
+        "A [--skills-dir] [/sk]\nA [--skills-dir] [/sk] [--session] [sess-1]\n"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    std::fs::write(lab.rec().join("honor-term"), "").unwrap();
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// Write the session lock `sess-1` for the child `pid`, as Kimi writes one when the person's
+/// first prompt opens a session: a child started with `FAKE_SESSION=none` holds none until then.
+fn open_session(lab: &Lab, pid: Pid) {
+    let dir = lab.root.join("kimi-home/locks/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pid = pid.as_raw_nonzero();
+    let host = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned();
+    let tmp = dir.join("sess-1.lock.tmp");
+    std::fs::write(
+        &tmp,
+        format!(
+            r#"{{"version":1,"token":"{pid}:x","pid":{pid},"hostname":"{host}","startedAt":1,"clientIdentity":"kimi_code_cli"}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::rename(&tmp, dir.join("sess-1.lock")).unwrap();
+}
+
+/// A restart aterm asked for that cannot be made (the child holds no session lock yet) waits at
+/// most the restart wait (`KIMI_ALAB_RESTART_WAIT_MS`, alab-wire's 45 s `AWAY_BUDGET` by
+/// default) from its arrival and is then refused: the session Kimi opens later, with the
+/// person's first prompt, is never ended for it. Before, a wait for the session never spent the
+/// budget, so the restart was made the moment the lock appeared, however much later.
+#[test]
+fn a_restart_that_cannot_be_made_in_time_is_refused_and_never_made_later() {
+    let mut lab = Lab::new("rs-stale");
+    let aterm = fake_aterm("rs-stale");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &vars(
+            &env,
+            &[
+                ("FAKE_SESSION", "none"),
+                ("KIMI_ALAB_RESTART_WAIT_MS", "1500"),
+            ],
+        ),
+    );
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || claims(&aterm).len() == 2));
+    aterm.send_restart("asked");
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains(
+            "RESTART-WAITS cause=asked no running child's session lock"
+        )),
+        "the restart did not wait for the session; journal:\n{}",
+        lab.journal()
+    );
+    sleep(Duration::from_millis(2500));
+    open_session(&lab, first);
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("SESSION the child holds session sess-1")),
+        "the harness never read the late session lock; journal:\n{}",
+        lab.journal()
+    );
+    // An absence: a restart that still waited is asked about again a second after the pass
+    // that read the lock; that and a whole pass go by, and a `RESTART` line is looked for.
+    lab.pass_after(
+        &mut child,
+        Duration::from_millis(alab_wire::link::LATER_RETRY_MS),
+    );
+    assert_eq!(lab.notes("RESTART"), 0, "journal:\n{}", lab.journal());
+    assert_eq!(lab.pid_of("A"), Some(first));
+    assert_eq!(lab.argv(), "A\n");
+    assert!(
+        lab.journal().contains(
+            "RESTART-REFUSED cause=asked not made within 1500 ms: no running child's session lock"
+        ),
+        "journal:\n{}",
+        lab.journal()
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// A restart aterm sends as the child is ending (for a restart under way) was meant for that
+/// child: it is passed over, and never applied to the child started after it. The harness is
+/// held still while the child ends and aterm's second request comes in, so both reach it in one
+/// wake, as they can on a loaded machine.
+#[test]
+fn a_restart_sent_as_the_child_ends_is_not_applied_to_the_next_child() {
+    let mut lab = Lab::new("rs-late");
+    let aterm = fake_aterm("rs-late");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(
+        &[],
+        &vars(
+            &env,
+            &[
+                ("FAKE_IGNORE_TERM", "1"),
+                ("KIMI_ALAB_TERM_GRACE_MS", "8000"),
+            ],
+        ),
+    );
+    let first = lab.pid_of("A").unwrap();
+    assert!(wait_for(DEADLINE, || lab.journal().contains("SESSION")));
+    aterm.send_restart("asked");
+    assert!(
+        wait_for(DEADLINE, || lab.events("A").contains("term-ignored")),
+        "A never took the restart's SIGTERM; journal:\n{}",
+        lab.journal()
+    );
+    signal(&child, Signal::STOP);
+    // A ends by a SIGTERM, an end the restart accepts as its own.
+    std::fs::write(lab.rec().join("honor-term"), "").unwrap();
+    kill_process(first, Signal::TERM).unwrap();
+    assert!(
+        wait_for(DEADLINE, || lab.events("A").contains("term\n")),
+        "A did not end; events:\n{}",
+        lab.events("A")
+    );
+    aterm.send_restart("stall");
+    sleep(Duration::from_millis(500));
+    signal(&child, Signal::CONT);
+    assert!(
+        wait_for(DEADLINE, || lab.pid_of("A").is_some_and(|pid| pid != first)),
+        "the asked restart was not made; journal:\n{}",
+        lab.journal()
+    );
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains(
+            "RESTART-PASSED-OVER cause=stall it came before this child was announced"
+        )),
+        "journal:\n{}",
+        lab.journal()
+    );
+    let second = lab.pid_of("A").unwrap();
+    // An absence: a restart applied to the new child would wait for its lock and be asked about
+    // again a second later; that and a whole pass go by, and a second `RESTART` is looked for.
+    lab.pass_after(
+        &mut child,
+        Duration::from_millis(alab_wire::link::LATER_RETRY_MS),
+    );
+    assert_eq!(lab.notes("RESTART"), 1, "journal:\n{}", lab.journal());
+    assert_eq!(lab.pid_of("A"), Some(second));
+    assert_eq!(lab.argv(), "A\nA [--session] [sess-1]\n");
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn a_halt_holds_a_move_a_person_attested_until_it_lifts() {
+    let mut lab = Lab::new("halt");
+    let aterm = fake_aterm("halt");
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert!(wait_for(DEADLINE, || claims(&aterm).len() == 2));
+    // aterm halts the session: `hold=1`, and the policy reads `effective=off why=hold`.
+    aterm.set_status("hold", Some("1"));
+    lab.install_b();
+    signal(&child, Signal::USR1);
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains("REFUSED wait aterm policy effective=off why=hold")),
+        "the halt did not hold the move; journal:\n{}",
+        lab.journal()
+    );
+    assert!(lab.pid_of("B").is_none());
+    // The claim was never given back, and moves once the halt lifts.
+    assert!(!aterm.verbs().iter().any(|verb| verb.contains("meta unset")));
+    aterm.set_status("hold", Some("0"));
+    assert!(
+        wait_for(DEADLINE, || lab.pid_of("B").is_some()),
+        "never moved after the halt lifted; journal:\n{}",
+        lab.journal()
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// A person's cap that narrows the standing contract-4 claim to `relaunch` hands the upgrade duty
+/// back to aterm's engine: an update a person attests with `SIGUSR1` under that claim is refused
+/// on aterm's `supervisor_scope`, however free the session is, and the claim is kept.
+/// NEGATIVE CONTROL: a cap that narrows the claim to `upgrade` instead leaves the duty with the
+/// harness, and the same attestation moves the vendor.
+#[test]
+fn a_move_a_person_attested_needs_the_upgrade_duty_granted() {
+    let (journal, moved) = attest_under_cap("capped-move", Scope::Relaunch);
+    assert!(
+        journal.contains("REFUSED aterm supervisor_scope=relaunch;") && !moved,
+        "a narrowed grant did not hold the move; journal:\n{journal}"
+    );
+    let (journal, moved) = attest_under_cap("capped-kept", Scope::Upgrade);
+    assert!(
+        moved && !journal.contains("REFUSED"),
+        "a grant that kept upgrade did not move; journal:\n{journal}"
+    );
+}
+
+/// Narrow the standing claim to `cap`, attest an update with `SIGUSR1`, and wait for the move or
+/// its refusal: the journal, and whether the vendor moved. The claim is never given back.
+fn attest_under_cap(name: &str, cap: Scope) -> (String, bool) {
+    let mut lab = Lab::new(name);
+    let aterm = fake_aterm(name);
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert!(wait_for(DEADLINE, || claims(&aterm).len() == 2));
+    aterm.set_cap(Some(&[cap]));
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains(&format!("NARROWED scope={} ", cap.word()))),
+        "journal:\n{}",
+        lab.journal()
+    );
+    lab.install_b();
+    signal(&child, Signal::USR1);
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains("REFUSED")
+            || lab.pid_of("B").is_some()),
+        "the attestation was neither refused nor moved; journal:\n{}",
+        lab.journal()
+    );
+    let moved = lab.pid_of("B").is_some();
+    assert!(!aterm.verbs().iter().any(|verb| verb.contains("meta unset")));
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+    (lab.journal(), moved)
+}
+
+/// Under contract 3, the roster guard: a harness off aterm's roster sends no claim, not even to
+/// find out, and Kimi runs in the harness's place.
+#[test]
+fn aterm_off_the_roster_is_never_claimed_and_kimi_runs_in_place() {
+    let mut lab = Lab::new("unrostered");
+    let aterm = fake_aterm("unrostered");
+    aterm.serve_contracts(&[2, 3]);
+    aterm.set_row("kimi-alab", &[]);
+    aterm.set_row("grok-alab", &Scope::CONTRACT_3);
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    // The harness execs the vendor in its own place.
+    assert_eq!(lab.pid_of("A"), Some(Pid::from_child(&child)));
+    assert!(
+        lab.journal().contains("PASS") && lab.journal().contains("unrostered"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    assert!(
+        aterm.verbs().iter().any(|verb| verb == "native-act info"),
+        "{:?}",
+        aterm.verbs()
+    );
+    assert!(
+        claims(&aterm).is_empty(),
+        "a claim was sent off the roster: {:?}",
+        aterm.verbs()
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// Under contract 4 aterm may grant less than the claim asked for. A launch granted less than
+/// both duties gives the claim back and Kimi runs in the harness's place, as under contract 3.
+#[test]
+fn a_claim_granted_less_than_both_duties_is_released_and_kimi_runs_in_place() {
+    let mut lab = Lab::new("scope");
+    let aterm = fake_aterm("scope");
+    aterm.set_known(&[Scope::Upgrade]);
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert_eq!(lab.pid_of("A"), Some(Pid::from_child(&child)));
+    assert!(
+        lab.journal()
+            .contains("scope=upgrade (the claim needs relaunch,upgrade)"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    assert!(
+        aterm
+            .verbs()
+            .iter()
+            .any(|verb| verb.starts_with("meta unset supervisor holder=kimi-alab@")),
+        "the claim was not given back: {:?}",
+        aterm.verbs()
+    );
+    assert_eq!(aterm.holder(), None);
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// Under contract 3 the scope is read back from `status`: a claim aterm stored with less than
+/// both duties (here a person's cap that lands between the claim and its read) is given back,
+/// and Kimi runs in the harness's place.
+#[test]
+fn a_contract_3_claim_read_back_with_less_than_both_duties_is_released() {
+    let mut lab = Lab::new("scope-three");
+    let aterm = fake_aterm("scope-three");
+    aterm.serve_contracts(&[2, 3]);
+    aterm.set_cap_after_next_claim(Some(&[Scope::Upgrade]));
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert_eq!(lab.pid_of("A"), Some(Pid::from_child(&child)));
+    assert!(
+        lab.journal()
+            .contains("unproven scope=relaunch supervisor_scope=upgrade"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    assert!(
+        aterm
+            .verbs()
+            .iter()
+            .any(|verb| verb.starts_with("meta unset supervisor holder=kimi-alab@")),
+        "the claim was not given back: {:?}",
+        aterm.verbs()
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+#[test]
+fn an_err_from_aterm_at_launch_keeps_the_child_supervised_and_claims_it_later() {
+    let mut lab = Lab::new("launch-err");
+    let aterm = fake_aterm("launch-err");
+    aterm.set_policy_reply(DIALOG_ERR);
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert_ne!(lab.pid_of("A"), Some(Pid::from_child(&child)));
+    assert!(
+        lab.journal().contains("UNCLAIMED policy reply=ERR:aterm"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    aterm.clear_policy_reply();
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains(" contract=4 scope=relaunch,upgrade ")),
+        "the claim was not made once aterm answered; journal:\n{}",
+        lab.journal()
+    );
+    // Claimed on the clock, with the child that runs already named.
+    let claims = claims(&aterm);
+    let a = lab.pid_of("A").unwrap().as_raw_nonzero();
+    assert_eq!(claims.len(), 1, "{claims:?}");
+    assert!(claims[0].contains(&format!(" child={a}:")), "{claims:?}");
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
+}
+
+/// A launch whose first claim aterm answers the handshake of and then answers late is aterm
+/// busy, not away: the child runs supervised and is claimed again on the clock.
+#[test]
+fn a_launch_aterm_answers_late_is_busy_not_gone() {
+    let mut lab = Lab::new("launch-busy");
+    let aterm = fake_aterm("launch-busy");
+    aterm.set_reply_delay(Duration::from_millis(900));
+    let env = aterm.env();
+    let mut child = lab.running_a_on_pty(&[], &vars(&env, &[]));
+    assert_ne!(lab.pid_of("A"), Some(Pid::from_child(&child)));
+    assert!(
+        lab.journal().contains("(aterm answered the handshake)"),
+        "journal:\n{}",
+        lab.journal()
+    );
+    aterm.set_reply_delay(Duration::ZERO);
+    assert!(
+        wait_for(DEADLINE, || lab
+            .journal()
+            .contains(" contract=4 scope=relaunch,upgrade ")),
+        "the claim was not made once aterm answered in time; journal:\n{}",
+        lab.journal()
+    );
+    signal(&child, Signal::TERM);
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1170,26 +1797,29 @@ fn never_moves_without_an_attestation() {
     let mut lab = Lab::new("no-attest");
     let mut child = lab.running_a_on_pty(&[], &[]);
     lab.install_b();
-    sleep(Duration::from_millis(1500));
+    // An absence: with no attestation, nothing moves. A move needs one quiet window, which
+    // goes by with the harness running; then its decision, a `MOVE` line, is looked for.
+    lab.pass_after(&mut child, Duration::from_millis(QUIET_MS));
+    assert_eq!(
+        lab.notes("MOVE"),
+        0,
+        "moved with no attestation; journal:\n{}",
+        lab.journal()
+    );
     assert!(lab.pid_of("B").is_none(), "moved with no attestation");
     assert!(
         !lab.events("A").contains("term"),
         "A was stopped with no attestation"
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 /// Attest, then require that the harness refuses with `why` and never touches A.
-fn assert_refused(lab: &Lab, child: &Child, why: &str) {
+fn assert_refused(lab: &Lab, child: &mut Child, why: &str) {
     signal(child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("REFUSED")),
+        wait_for(DEADLINE, || lab.journal().contains("REFUSED")),
         "no refusal; journal:\n{}",
         lab.journal()
     );
@@ -1198,7 +1828,18 @@ fn assert_refused(lab: &Lab, child: &Child, why: &str) {
         j.contains(why),
         "refused, but not for {why:?}; journal:\n{j}"
     );
-    sleep(Duration::from_millis(600));
+    // An absence: a refusal ends the attestation, and the harness never retries on its own.
+    // A retry under the same attestation is refused again for the same reason, at once for a
+    // busy child and after a quiet window otherwise; that window goes by with the harness
+    // running, and the refusals are counted.
+    lab.pass_after(child, Duration::from_millis(QUIET_MS));
+    assert_eq!(
+        lab.notes("REFUSED"),
+        1,
+        "retried under the refused attestation; journal:\n{}",
+        lab.journal()
+    );
+    assert_eq!(lab.notes("MOVE"), 0, "journal:\n{}", lab.journal());
     assert!(
         lab.pid_of("B").is_none(),
         "moved a busy child; journal:\n{}",
@@ -1212,39 +1853,42 @@ fn never_moves_while_the_child_draws() {
     let mut lab = Lab::new("drawing");
     let mut child = lab.running_a_on_pty(&[], &[("FAKE_DRAW", "1")]);
     lab.install_b();
-    assert_refused(&lab, &child, "the screen was drawn");
+    assert_refused(&lab, &mut child, "the screen was drawn");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
 fn never_moves_while_a_person_types() {
     let mut lab = Lab::new("typing");
-    let mut child = lab.running_a_on_pty(&[], &[("FAKE_READ", "1")]);
+    // A keystroke must be read inside the quiet window after the attestation. A typist that
+    // does not get the CPU for a whole window would let the move through, so the window here
+    // is long; the refusal still comes at the first keystroke read after the attestation.
+    let mut child =
+        lab.running_a_on_pty(&[], &[("FAKE_READ", "1"), ("KIMI_ALAB_QUIET_MS", "10000")]);
     lab.install_b();
+    // The person types from before the attestation until the harness refuses.
+    let typing = Arc::new(AtomicBool::new(true));
+    let typist = {
+        let typing = Arc::clone(&typing);
+        let mut keys = lab.keyboard();
+        std::thread::spawn(move || {
+            while typing.load(Ordering::SeqCst) {
+                let _ = keys.write_all(b"x\n");
+                sleep(Duration::from_millis(20));
+            }
+        })
+    };
     signal(&child, Signal::USR1);
-    for _ in 0..20 {
-        lab.type_keys(b"x\n");
-        sleep(Duration::from_millis(50));
-    }
-    assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("REFUSED")),
-        "journal:\n{}",
-        lab.journal()
-    );
+    let refused = wait_for(DEADLINE, || lab.journal().contains("REFUSED"));
+    typing.store(false, Ordering::SeqCst);
+    typist.join().unwrap();
+    assert!(refused, "journal:\n{}", lab.journal());
     let j = lab.journal();
     assert!(j.contains("a keystroke was read"), "journal:\n{j}");
     assert!(lab.pid_of("B").is_none(), "moved while a person typed");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1252,13 +1896,10 @@ fn never_moves_while_the_child_works() {
     let mut lab = Lab::new("working");
     let mut child = lab.running_a_on_pty(&[], &[("FAKE_BURN", "1")]);
     lab.install_b();
-    assert_refused(&lab, &child, "of CPU");
+    assert_refused(&lab, &mut child, "of CPU");
     std::fs::write(lab.rec().join("stop-burn"), "").unwrap();
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1267,13 +1908,9 @@ fn never_moves_while_background_work_runs() {
     std::fs::write(lab.rec().join("background-work"), "").unwrap();
     let mut child = lab.running_a_on_pty(&[], &[]);
     lab.install_b();
-    assert_refused(&lab, &child, "background work runs under the child: sh");
-    std::fs::write(lab.rec().join("stop-background"), "").unwrap();
+    assert_refused(&lab, &mut child, "background work runs under the child: sh");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1283,14 +1920,11 @@ fn never_moves_a_child_that_holds_no_session() {
     lab.install_b();
     assert_refused(
         &lab,
-        &child,
+        &mut child,
         "no current or most recently proven session lock",
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1300,16 +1934,13 @@ fn never_moves_without_a_terminal() {
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&[], &[]);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("A").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("A").is_some()),
         "A never started"
     );
     lab.install_b();
-    assert_refused(&lab, &child, "no terminal");
+    assert_refused(&lab, &mut child, "no terminal");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1319,19 +1950,23 @@ fn a_one_shot_launch_is_never_moved() {
     lab.install_b();
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("UPDATE-WAITS")),
+        wait_for(DEADLINE, || lab.journal().contains("UPDATE-WAITS")
+            && lab.notes("ATTEST") == 1),
         "journal:\n{}",
         lab.journal()
     );
-    sleep(Duration::from_millis(800));
+    // An absence: a one-shot launch waits out the update. A move needs one quiet window, which
+    // goes by with the harness running; then its decision, a `MOVE` line, is looked for.
+    lab.pass_after(&mut child, Duration::from_millis(QUIET_MS));
+    assert_eq!(
+        lab.notes("MOVE"),
+        0,
+        "moved a one-shot launch; journal:\n{}",
+        lab.journal()
+    );
     assert!(lab.pid_of("B").is_none(), "moved a one-shot launch");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1340,9 +1975,18 @@ fn no_update_mode_never_moves() {
     let mut child = lab.running_a_on_pty(&["--alab-no-update"], &[]);
     lab.lay(BUILD_B, "B", "2.3.2");
     lab.make_current(BUILD_B);
-    sleep(Duration::from_millis(300));
+    // Absences: B is never noticed, and nothing moves. The store would be looked at on every
+    // pass, so a whole pass goes by before it is attested idle; then a move would need one
+    // quiet window, which goes by with the harness running, before its `MOVE` is looked for.
+    lab.pass(&mut child);
     signal(&child, Signal::USR1);
-    sleep(Duration::from_millis(1200));
+    assert!(
+        wait_for(DEADLINE, || lab.notes("ATTEST") == 1),
+        "the attestation was not taken; journal:\n{}",
+        lab.journal()
+    );
+    lab.pass_after(&mut child, Duration::from_millis(QUIET_MS));
+    assert_eq!(lab.notes("MOVE"), 0, "journal:\n{}", lab.journal());
     assert!(lab.pid_of("B").is_none(), "moved under --alab-no-update");
     assert!(
         !lab.journal().contains("UPDATE "),
@@ -1350,10 +1994,7 @@ fn no_update_mode_never_moves() {
     );
     assert_eq!(lab.argv(), "A\n", "--alab-no-update reached the vendor");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1362,7 +2003,7 @@ fn refuses_to_run_a_store_binary_that_is_the_harness_itself() {
     lab.lay_harness(BUILD_A, "2.3.1");
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&["--yolo"], &[]);
-    let st = wait_exit(&mut child, Duration::from_secs(10));
+    let st = wait_exit(&mut child, DEADLINE);
     let err = stderr_of(&mut child);
     assert_eq!(st.code(), Some(126), "stderr: {err}");
     assert!(err.contains("is this harness itself"), "{err}");
@@ -1375,7 +2016,7 @@ fn a_store_kimi_that_execs_the_harness_is_refused_at_once() {
     lab.lay_script(BUILD_A, &CHAIN.replace("@RUN@", "exec"), "2.3.1");
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&[], &[("HARNESS_BIN", HARNESS), ("CHAIN_CAP", "4")]);
-    let st = wait_exit(&mut child, Duration::from_secs(20));
+    let st = wait_exit(&mut child, DEADLINE);
     let err = stderr_of(&mut child);
     assert_eq!(
         lab.chain(),
@@ -1392,7 +2033,7 @@ fn a_store_kimi_that_runs_the_harness_as_a_child_stops_at_the_depth_limit() {
     lab.lay_script(BUILD_A, &CHAIN.replace("@RUN@", ""), "2.3.1");
     lab.make_current(BUILD_A);
     let mut child = lab.spawn(&[], &[("HARNESS_BIN", HARNESS), ("CHAIN_CAP", "20")]);
-    let st = wait_exit(&mut child, Duration::from_secs(60));
+    let st = wait_exit(&mut child, 2 * DEADLINE);
     let err = stderr_of(&mut child);
     let depths: Vec<String> = (0..8).map(|n| n.to_string()).collect();
     assert_eq!(
@@ -1411,23 +2052,25 @@ fn an_update_to_the_harness_itself_is_never_taken() {
     lab.lay_harness(BUILD_B, "2.3.2");
     lab.make_current(BUILD_B);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("UPDATE-REFUSED")),
+        wait_for(DEADLINE, || lab.journal().contains("UPDATE-REFUSED")),
         "journal:\n{}",
         lab.journal()
     );
     signal(&child, Signal::USR1);
-    sleep(Duration::from_millis(1200));
+    // An absence: nothing moves onto the harness. The attestation is taken, and a move would
+    // need one quiet window, which goes by with the harness running, before it is looked for.
+    assert!(
+        wait_for(DEADLINE, || lab.notes("ATTEST") == 1),
+        "the attestation was not taken; journal:\n{}",
+        lab.journal()
+    );
+    lab.pass_after(&mut child, Duration::from_millis(QUIET_MS));
     let j = lab.journal();
     assert!(!j.contains("MOVE"), "moved onto the harness itself:\n{j}");
     assert!(!lab.events("A").contains("term"), "A was stopped:\n{j}");
     assert_eq!(lab.argv(), "A\n");
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1439,15 +2082,13 @@ fn a_relaunch_skips_a_current_build_that_is_the_harness_itself() {
     lab.lay_harness(BUILD_C, "2.3.3");
     lab.make_current(BUILD_C);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("UPDATE-REFUSED")),
+        wait_for(DEADLINE, || lab.journal().contains("UPDATE-REFUSED")),
         "journal:\n{}",
         lab.journal()
     );
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("B").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("B").is_some()),
         "never resumed on B; journal:\n{}",
         lab.journal()
     );
@@ -1462,10 +2103,7 @@ fn a_relaunch_skips_a_current_build_that_is_the_harness_itself() {
         "the harness exited during the move:\n{j}"
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1477,57 +2115,84 @@ fn a_broken_stderr_never_ends_the_harness_during_a_move() {
     lab.install_b();
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("B").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("B").is_some()),
         "never moved to B (status {:?}); journal:\n{}",
         child.try_wait().unwrap(),
         lab.journal()
     );
-    sleep(Duration::from_millis(300));
+    // The harness says it resumes the session on its stderr before it starts B, and journals
+    // `RELAUNCHED` after; once that is journalled and it has gone round its loop again, the
+    // write to the broken stderr is behind it.
+    assert!(
+        wait_for(DEADLINE, || lab.journal().contains(" RELAUNCHED ")
+            || child.try_wait().unwrap().is_some()),
+        "the move was never journalled; journal:\n{}",
+        lab.journal()
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the harness died writing to a broken stderr; journal:\n{}",
+        lab.journal()
+    );
+    lab.pass(&mut child);
     assert!(
         child.try_wait().unwrap().is_none(),
         "the harness died writing to a broken stderr; journal:\n{}",
         lab.journal()
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
 fn a_child_that_ignores_sigterm_abandons_the_move_and_runs_on() {
     let mut lab = Lab::new("term-grace");
+    let term_grace = TERM_GRACE_MS.to_string();
     let mut child = lab.running_a_on_pty(
         &["--skills-dir", "/sk"],
         &[
             ("FAKE_IGNORE_TERM", "1"),
-            ("KIMI_ALAB_TERM_GRACE_MS", "300"),
+            ("KIMI_ALAB_TERM_GRACE_MS", &term_grace),
         ],
     );
     lab.install_b();
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("MOVE-ABANDONED")),
+        wait_for(DEADLINE, || lab.journal().contains("MOVE-ABANDONED")),
         "never abandoned the move; journal:\n{}",
         lab.journal()
     );
-    assert_eq!(
+    let ignored = || {
         lab.events("A")
             .lines()
             .filter(|l| *l == "term-ignored")
-            .count(),
-        1,
-        "events:\n{}",
+            .count()
+    };
+    // A's trap can run after the harness has given up on it.
+    assert!(
+        wait_for(DEADLINE, || ignored() >= 1),
+        "A never took its SIGTERM; events:\n{}",
         lab.events("A")
     );
+    assert_eq!(ignored(), 1, "events:\n{}", lab.events("A"));
     assert!(lab.pid_of("B").is_none());
     assert!(child.try_wait().unwrap().is_none());
-    // A second attestation while B is still current never signals A for B again.
+    // A second attestation while B is still current never signals A for B again. An absence:
+    // the attestation is taken, and a second try would be decided one quiet window later,
+    // which goes by with the harness running; then that decision, a `MOVE` line, is counted.
     signal(&child, Signal::USR1);
-    sleep(Duration::from_millis(700));
+    assert!(
+        wait_for(DEADLINE, || lab.notes("ATTEST") == 2),
+        "the second attestation was not taken; journal:\n{}",
+        lab.journal()
+    );
+    lab.pass_after(&mut child, Duration::from_millis(QUIET_MS));
+    assert_eq!(
+        lab.notes("MOVE"),
+        1,
+        "moved again onto abandoned build B; journal:\n{}",
+        lab.journal()
+    );
     assert_eq!(
         lab.events("A")
             .lines()
@@ -1542,7 +2207,7 @@ fn a_child_that_ignores_sigterm_abandons_the_move_and_runs_on() {
     lab.lay(BUILD_C, "C", "2.3.3");
     lab.make_current(BUILD_C);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
+        wait_for(DEADLINE, || lab
             .journal()
             .contains("2.3.1 -> 2.3.3 is current")),
         "never saw C; journal:\n{}",
@@ -1550,15 +2215,12 @@ fn a_child_that_ignores_sigterm_abandons_the_move_and_runs_on() {
     );
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("C").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("C").is_some()),
         "never moved to C; journal:\n{}",
         lab.journal()
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 #[test]
@@ -1570,22 +2232,18 @@ fn a_move_onto_a_build_that_refuses_to_start_falls_back_and_abandons_it() {
     lab.lay_script(BUILD_B, broken_b, "2.3.2");
     lab.make_current(BUILD_B);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("UPDATE ")),
+        wait_for(DEADLINE, || lab.journal().contains("UPDATE ")),
         "never saw B; journal:\n{}",
         lab.journal()
     );
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
-            .journal()
-            .contains("MOVE-FAILED")),
+        wait_for(DEADLINE, || lab.journal().contains("MOVE-FAILED")),
         "never noted MOVE-FAILED; journal:\n{}",
         lab.journal()
     );
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("A") != Some(first_a)
+        wait_for(DEADLINE, || lab.pid_of("A") != Some(first_a)
             && lab.pid_of("A").is_some()),
         "never fell back onto a resumed A; journal:\n{}",
         lab.journal()
@@ -1595,9 +2253,22 @@ fn a_move_onto_a_build_that_refuses_to_start_falls_back_and_abandons_it() {
         "A [--skills-dir] [/sk]\nB [--skills-dir] [/sk] [--session] [sess-1]\nA [--skills-dir] [/sk] [--session] [sess-1]\n"
     );
     assert!(child.try_wait().unwrap().is_none());
-    // A second attestation while B is still current does not try B again.
+    // A second attestation while B is still current does not try B again. An absence: the
+    // attestation is taken, and a second try would be decided one quiet window later, which
+    // goes by with the harness running; then that decision, a `MOVE` line, is counted.
     signal(&child, Signal::USR1);
-    sleep(Duration::from_millis(700));
+    assert!(
+        wait_for(DEADLINE, || lab.notes("ATTEST") == 2),
+        "the second attestation was not taken; journal:\n{}",
+        lab.journal()
+    );
+    lab.pass_after(&mut child, Duration::from_millis(QUIET_MS));
+    assert_eq!(
+        lab.notes("MOVE"),
+        1,
+        "tried abandoned build B again; journal:\n{}",
+        lab.journal()
+    );
     assert_eq!(
         lab.argv().lines().count(),
         3,
@@ -1609,7 +2280,7 @@ fn a_move_onto_a_build_that_refuses_to_start_falls_back_and_abandons_it() {
     lab.lay(BUILD_C, "C", "2.3.3");
     lab.make_current(BUILD_C);
     assert!(
-        wait_for(Duration::from_secs(10), || lab
+        wait_for(DEADLINE, || lab
             .journal()
             .contains("2.3.1 -> 2.3.3 is current")),
         "never saw C; journal:\n{}",
@@ -1617,15 +2288,12 @@ fn a_move_onto_a_build_that_refuses_to_start_falls_back_and_abandons_it() {
     );
     signal(&child, Signal::USR1);
     assert!(
-        wait_for(Duration::from_secs(10), || lab.pid_of("C").is_some()),
+        wait_for(DEADLINE, || lab.pid_of("C").is_some()),
         "never moved to C; journal:\n{}",
         lab.journal()
     );
     signal(&child, Signal::TERM);
-    assert_eq!(
-        wait_exit(&mut child, Duration::from_secs(10)).code(),
-        Some(143)
-    );
+    assert_eq!(wait_exit(&mut child, DEADLINE).code(), Some(143));
 }
 
 /// The measurement the safe point stands on: on this OS, a pty's slave times move as

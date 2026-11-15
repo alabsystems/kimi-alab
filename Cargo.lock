@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "alab-wire"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -26,8 +33,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kimi-alab"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
+ "alab-wire",
  "libc",
  "rustix",
  "serde_json",

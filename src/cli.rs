@@ -189,11 +189,14 @@ When atpkg makes a different {cmd} build current while the session runs, {NAME} 
 safe point and resumes the same session on the new build (`{cmd} … --session <id>`) without
 exiting. A new {NAME} build crosses the same safe point by exec: the harness keeps its pid and
 the child runs on, with its session and account state carried to the new image. Under a proven
-aterm contract-3 claim (scope=relaunch,upgrade), aterm's own idle and empty-composer status
-supplies the attestation. Elsewhere `kill -USR1 <{NAME} pid>` supplies it. Both then need
+aterm claim (scope=relaunch,upgrade, at contract 4 or 3), aterm's own idle and empty-composer
+status supplies the attestation. Elsewhere `kill -USR1 <{NAME} pid>` supplies it. Both then need
 {quiet} s with no keystroke read, nothing drawn, no process started or ended under {cmd}, and
-almost no CPU. A busy {cmd} is never stopped. If aterm cannot prove the claim, {NAME} execs {cmd}
-in its place instead of leaving two supervisors.
+almost no CPU. A busy {cmd} is never stopped. If aterm cannot prove the claim with both duties
+(under contract 3, if its roster has no {NAME} row), {NAME} execs {cmd} in its place instead of
+leaving two supervisors. Under the claim, a {cmd} that crashes is resumed on its session by aterm's own rule
+(nobody typing, holding or driving the session) after 1 s, 10 s, 60 s, then 10 min, and a
+restart aterm asks for is made with SIGTERM, then SIGKILL if {cmd} does not end.
 
 ENVIRONMENT
   KIMI_ALAB_PKG_PREFIX   the atpkg prefix (default: aterm.toml [packages] prefix, else

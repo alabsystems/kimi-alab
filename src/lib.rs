@@ -14,8 +14,10 @@
 //! Modules, in the order a run uses them: [`cli`] (the harness's own words), [`store`] (the
 //! vendor binary, from the atpkg store only), [`kimi`] (the vendor profile: resume grammar,
 //! session locks), [`supervise`] (the child, its signals, the move), [`safepoint`] with
-//! [`tty`] and [`proc`] (when a move is allowed), [`journal`], and [`aterm`] (the contract-3
-//! client: proven relaunch/upgrade claims and aterm's safe-point witnesses).
+//! [`tty`] and [`proc`] (when a move is allowed), [`journal`], and [`aterm`] (this harness's
+//! side of its link to aterm). The link itself, the claim at contract 4 or 3 with its guards, the
+//! claim held, lost and claimed again, aterm's rule for whose exit it was, and the crash back-off,
+//! is the shared library `alab-wire`.
 
 #![cfg(unix)]
 

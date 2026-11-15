@@ -1,0 +1,30 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# alab-harness: the half every ALab harness needs, shared (aterm's harness
+# interface design, section 3). One workspace; each crate is its own member
+# under crates/. Today: alab-wire. To come: alab-policy and alab-accounts.
+#
+# Consumers do not take this repository as a git dependency: each harness
+# carries a copy of one tagged version inside its own tree (README.md).
+
+[workspace]
+members = ["crates/alab-wire"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Andrew Yates"]
+publish = false
+
+[workspace.dependencies]
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

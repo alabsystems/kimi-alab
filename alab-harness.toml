@@ -1,0 +1,10 @@
+# What aterm knows about this harness. `atpkg-publish pack` copies the [harness] table into the
+# package's signed manifest; aterm makes a registry row from it only when that manifest verifies
+# (aterm docs/DESIGN-harness-interface-2026-11-12.md §2.1). The publisher refuses unknown keys.
+[harness]
+id        = "kimi-alab"
+tool      = "kimi-alab"
+leads     = ["kimi"]
+contracts = [3, 4]            # alab-wire claims at 4 where aterm serves it, else at 3
+name      = "Kimi Code"
+env_strip = ["KIMI_", "MOONSHOT_"]

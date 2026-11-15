@@ -4,6 +4,8 @@
 //! `kimi-alab`: run Kimi Code from the atpkg store under the ALab harness.
 
 #[cfg(unix)]
+use alab_wire::Link;
+#[cfg(unix)]
 use kimi_alab::{
     aterm,
     cli::{self, Command, NAME},
@@ -67,10 +69,9 @@ fn which(env: &Env) {
         Err(e) => println!("kimi home unusable: {e}"),
     }
     println!(
-        "aterm     contract {} scope={} claimed by {} when the host proves it",
-        aterm::CONTRACT,
-        aterm::SCOPE,
-        aterm::holder(std::process::id())
+        "aterm     contract 4, else 3, scope={} claimed by {} when the host proves it",
+        alab_wire::claim::scope_words(&aterm::SCOPES),
+        alab_wire::claim::holder(aterm::HOLDER_ID, std::process::id())
     );
 }
 
@@ -108,35 +109,83 @@ fn pass_through(
     });
 }
 
-/// Claim this session's relaunch and upgrade duties when aterm serves and proves contract 3.
+/// Why this launch makes no claim at all and runs the vendor in its place, before aterm is
+/// asked anything: the person left the harness out, or the launch cannot be resumed on another
+/// build, so no duty could be performed.
 #[cfg(unix)]
-fn claim(
-    env: &Env,
-    build: &Build,
-    args: &[std::ffi::OsString],
-    login: Option<&str>,
-) -> Result<aterm::Claimed, String> {
+fn unclaimable(env: &Env, args: &[std::ffi::OsString]) -> Option<String> {
     if aterm::left_out(env) {
-        return Err(format!(
+        return Some(format!(
             "{}=1 leaves the harness out",
             aterm::NO_HARNESS_ENV
         ));
     }
-    let words = args
+    let Some(words) = args
         .iter()
         .map(|word| word.to_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()
-        .ok_or("the launch carries a word that is not UTF-8")?;
-    kimi::carried(&words).map_err(|why| why.to_string())?;
-    let locator = aterm::Locator::from_env(env)?;
-    aterm::claim(
-        &locator,
-        std::process::id(),
-        cli::VERSION,
-        build.version.as_deref(),
-        login,
-        aterm::TIMEOUT,
-    )
+    else {
+        return Some("the launch carries a word that is not UTF-8".to_string());
+    };
+    kimi::carried(&words).err().map(|why| why.to_string())
+}
+
+/// The launch's link to aterm (`alab-wire`): the policy, the roster guard under contract 3, the
+/// claim at the highest contract aterm serves, and its scope read back, made before the first
+/// child starts; or, for a child an earlier harness image ran, the same claim kept trying
+/// whatever aterm answers. `Err` is why the vendor runs in the harness's place instead.
+#[cfg(unix)]
+fn claim(
+    env: &Env,
+    start: &supervise::Start,
+    args: &[std::ffi::OsString],
+    journal: &mut Journal,
+) -> Result<Link, String> {
+    let config = aterm::config();
+    let me = std::process::id();
+    let now = aterm::now_ms();
+    let lookup = aterm::lookup(env);
+    let fresh = match start {
+        supervise::Start::Fresh(build) => build,
+        supervise::Start::Adopt(state) => {
+            let login = state.account.as_ref().map(|account| account.label.as_str());
+            let child = aterm::child(
+                state.build.version.as_deref(),
+                login,
+                u32::try_from(state.pid).ok(),
+            );
+            let mut link = Link::adopt_with(config, me, child, now, lookup);
+            aterm::journal(&mut link, journal);
+            return Ok(link);
+        }
+    };
+    if let Some(why) = unclaimable(env, args) {
+        return Err(why);
+    }
+    let child = aterm::child(fresh.version.as_deref(), None, None);
+    let mut link = Link::launch_with(config, me, child, now, lookup);
+    let last = aterm::journal(&mut link, journal);
+    if link.is_absent() {
+        return Err(last.unwrap_or_else(|| "aterm made no claim".to_string()));
+    }
+    if link.judges() && !aterm::takes_both(&link) {
+        let granted = aterm::granted(&link);
+        link.release(aterm::now_ms());
+        return Err(format!(
+            "scope={granted} (the claim needs {})",
+            alab_wire::claim::scope_words(&aterm::SCOPES)
+        ));
+    }
+    if link.is_lost() {
+        // aterm answered the handshake and then could not say now (an `ERR` that asks to be
+        // retried, a reply late past its bound, a policy off for now): it is there, so the
+        // child runs supervised and the claim is made again on the link's clock.
+        journal.note(
+            "UNCLAIMED",
+            "the child stays supervised while the claim is tried again every 5 s",
+        );
+    }
+    Ok(link)
 }
 
 #[cfg(unix)]
@@ -195,7 +244,7 @@ fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
     };
     let adopted = matches!(&start, supervise::Start::Adopt(_));
     let mut journal = Journal::open(env);
-    let claim = if aterm::under_aterm(env) {
+    let link = if aterm::hosted(env, &aterm::config()) {
         if no_update && !adopted {
             let supervise::Start::Fresh(build) = &start else {
                 unreachable!()
@@ -208,48 +257,20 @@ fn run(env: &Env, no_update: bool, args: &[std::ffi::OsString]) -> ! {
                 "--alab-no-update leaves no upgrade duty",
             );
         }
-        let (build, login) = match &start {
-            supervise::Start::Fresh(build) => (build, None),
-            supervise::Start::Adopt(state) => (
-                &state.build,
-                state.account.as_ref().map(|account| account.label.as_str()),
-            ),
-        };
-        match claim(env, build, args, login) {
-            Ok(claimed) => {
-                journal.note(
-                    "CLAIMED",
-                    &format!(
-                        "{} holds scope={} under aterm contract {} (aterm {})",
-                        claimed.holder,
-                        aterm::SCOPE,
-                        aterm::CONTRACT,
-                        claimed.conn.version
-                    ),
-                );
-                Some(claimed)
-            }
-            Err(why) if adopted => {
-                journal.note(
-                    "UNCLAIMED",
-                    &format!(
-                        "the adopted child stays supervised while the claim is retried: {why}"
-                    ),
-                );
-                None
-            }
+        match claim(env, &start, args, &mut journal) {
+            Ok(link) => link,
             Err(why) => {
                 let supervise::Start::Fresh(build) = &start else {
-                    unreachable!()
+                    unreachable!("an adopted child's claim never fails")
                 };
                 pass_through(build, args, depth, &mut journal, &why)
             }
         }
     } else {
-        None
+        Link::absent(aterm::config(), std::process::id())
     };
     let settings = supervise::Settings::from_env(prefix.path, env.clone(), no_update, depth);
-    let outcome = supervise::run(&settings, start, args, claim, &mut journal);
+    let outcome = supervise::run(&settings, start, args, link, &mut journal);
     journal.note("EXIT", &format!("{outcome:?}"));
     drop(journal);
     supervise::finish(outcome)

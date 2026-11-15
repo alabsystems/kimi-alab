@@ -40,7 +40,11 @@ use signal_hook::consts::signal::{
     SIGTERM, SIGTRAP, SIGTSTP, SIGUSR1, SIGUSR2,
 };
 
-use crate::aterm::{self, Claimed, SafePointError};
+use alab_wire::link::LATER_RETRY_MS;
+use alab_wire::relaunch::{AWAY_BUDGET, AwayBudget, ChildEnd, Ladder};
+use alab_wire::{Account, ChildProcess, Link, Reading, Relaunch, Restart, Verdict as Word};
+
+use crate::aterm;
 use crate::cli::NAME;
 use crate::env::Env;
 use crate::journal::Journal;
@@ -131,6 +135,9 @@ pub struct Settings {
     pub poll: Duration,
     /// How long the child has to exit after the harness's `SIGTERM` before the move is abandoned.
     pub term_grace: Duration,
+    /// How long a restart aterm asked for may wait, from its arrival, for the child's session
+    /// lock and for aterm's word before it is refused (alab-wire's [`AWAY_BUDGET`], 45 s).
+    pub restart_wait: Duration,
     /// Never move the child onto a new build.
     pub no_update: bool,
     /// This harness's nesting depth ([`nesting`]); its children get one more.
@@ -139,8 +146,8 @@ pub struct Settings {
 
 impl Settings {
     /// Settings from `env`: the defaults, with the test and tuning knobs
-    /// `KIMI_ALAB_POLL_MS`, `KIMI_ALAB_QUIET_MS`, `KIMI_ALAB_ATTEST_MS` and
-    /// `KIMI_ALAB_TERM_GRACE_MS` read when set.
+    /// `KIMI_ALAB_POLL_MS`, `KIMI_ALAB_QUIET_MS`, `KIMI_ALAB_ATTEST_MS`,
+    /// `KIMI_ALAB_TERM_GRACE_MS` and `KIMI_ALAB_RESTART_WAIT_MS` read when set.
     pub fn from_env(prefix: PathBuf, env: Env, no_update: bool, depth: u32) -> Self {
         let ms = |name: &str| {
             env.get(name)
@@ -159,12 +166,16 @@ impl Settings {
         let term_grace = ms("KIMI_ALAB_TERM_GRACE_MS")
             .unwrap_or(Duration::from_secs(30))
             .clamp(Duration::from_millis(100), Duration::from_secs(600));
+        let restart_wait = ms("KIMI_ALAB_RESTART_WAIT_MS")
+            .unwrap_or(AWAY_BUDGET)
+            .clamp(Duration::from_millis(100), Duration::from_secs(3600));
         Self {
             prefix,
             env,
             knobs,
             poll,
             term_grace,
+            restart_wait,
             no_update,
             depth,
         }
@@ -237,6 +248,14 @@ impl Status {
         }
     }
 
+    /// The end as `alab-wire` judges it.
+    pub fn end(self) -> ChildEnd {
+        match self {
+            Self::Code(code) => ChildEnd::Exited(code),
+            Self::Killed(signal) => ChildEnd::Signaled(signal),
+        }
+    }
+
     /// Whether this is how Kimi ends after the harness's `SIGTERM`: its graceful stop's 143, or
     /// death by the signal itself.
     pub fn after_our_term(self) -> bool {
@@ -269,6 +288,10 @@ impl std::fmt::Display for Status {
 enum Reap {
     Running,
     Stopped,
+    /// The child was continued: after the harness's own `SIGCONT`, or after a stop the harness
+    /// never saw, as when a whole-job `^Z` stopped the harness with it and the shell's `fg`
+    /// continued both (the stop is then no longer reported, only the continue).
+    Continued,
     Ended(Status),
 }
 
@@ -280,7 +303,7 @@ fn reap(pid: Pid) -> Reap {
         ) {
             Ok(None) => return Reap::Running,
             Ok(Some((_, st))) if st.stopped() => return Reap::Stopped,
-            Ok(Some((_, st))) if st.continued() => {}
+            Ok(Some((_, st))) if st.continued() => return Reap::Continued,
             Ok(Some((_, st))) => {
                 if let Some(code) = st.exit_status() {
                     return Reap::Ended(Status::Code(code));
@@ -308,9 +331,12 @@ struct Running {
     /// The session most recently proven by this running child's lock.
     session: Option<String>,
     /// The managed account home this child runs on, if aterm selected one.
-    account: Option<aterm::Account>,
+    account: Option<Account>,
     /// Kernel identity required before this child may cross a harness re-exec.
     identity: Option<proc::ChildIdentity>,
+    /// The child's pid and kernel start time as aterm checks a claim's `child=`, when they could
+    /// be read.
+    process: Option<ChildProcess>,
     started: Instant,
 }
 
@@ -320,7 +346,7 @@ const CREDENTIAL_OVERRIDES: [&str; 3] = [
     "KIMI_CODE_CUSTOM_HEADERS",
 ];
 
-fn apply_account(env: &mut Env, account: Option<&aterm::Account>) {
+fn apply_account(env: &mut Env, account: Option<&Account>) {
     let Some(account) = account else {
         return;
     };
@@ -341,7 +367,7 @@ impl Running {
         build: Build,
         args: &[OsString],
         depth: u32,
-        account: Option<&aterm::Account>,
+        account: Option<&Account>,
     ) -> std::io::Result<Self> {
         if store::is_this_harness(&build.exe) {
             return Err(std::io::Error::new(
@@ -372,6 +398,7 @@ impl Running {
         let child = cmd.spawn()?;
         let pid = Pid::from_child(&child);
         let identity = proc::capture_child(child.id());
+        let process = ChildProcess::of(child.id()).ok();
         let words = args
             .iter()
             .map(|a| a.to_str().map(str::to_owned))
@@ -385,6 +412,7 @@ impl Running {
             session: None,
             account: account.cloned(),
             identity,
+            process,
             started: Instant::now(),
         })
     }
@@ -429,6 +457,7 @@ impl Running {
             session,
             account,
             identity: Some(identity),
+            process: ChildProcess::of(raw_pid).ok(),
             started,
         })
     }
@@ -467,20 +496,92 @@ impl Running {
     fn signal(&self, sig: Signal) {
         let _ = kill_process(self.pid, sig);
     }
+
+    /// The account label the claim announces for this child.
+    fn login(&self) -> Option<&str> {
+        self.account.as_ref().map(|account| account.label.as_str())
+    }
+
+    /// What the claim says about this child: its build, its account and its process.
+    fn claim(&self) -> alab_wire::Child<'_> {
+        alab_wire::Child {
+            vendor: self.build.version.as_deref(),
+            login: self.login(),
+            process: self.process,
+        }
+    }
 }
 
 /// How long after a move's relaunch an immediate non-zero exit or fault counts as the new build
 /// refusing to start (falling back onto the previous build).
 const STARTUP_GRACE: Duration = Duration::from_secs(15);
 
-/// A move onto a new build, under way: `SIGTERM` was sent at a safe point.
+/// A move onto a new build, or a restart aterm asked for, under way: `SIGTERM` was sent.
 struct Moving {
     argv: Vec<String>,
     session: String,
     from: String,
     target: Build,
-    account: Option<aterm::Account>,
+    account: Option<Account>,
+    /// When the last signal was sent, on a clock that stops while the machine sleeps; time the
+    /// child spends stopped does not count either: [`run`] starts it again when the harness
+    /// continues a child that stopped alone, and whenever [`reap`] reports a continue.
     sent: Instant,
+    /// For a restart aterm asked for, how a child deaf to the `SIGTERM` is ended.
+    restart: Option<Escalation>,
+}
+
+/// A restart aterm asked for is made whatever the child does with its `SIGTERM`: aterm's own
+/// restart act sends `SIGKILL` to a program still running after its grace
+/// (`crates/aterm-gui/src/restart_act.rs` `escalate`), and under this harness's `relaunch`
+/// claim aterm leaves that to the holder.
+struct Escalation {
+    cause: String,
+    /// How long after the `SIGTERM` the `SIGKILL` follows.
+    kill_after: Duration,
+    /// Whether the `SIGKILL` was sent.
+    killed: bool,
+}
+
+impl Escalation {
+    /// aterm's grace: 5 s for a stalled program (it reads nothing, so it cannot take the
+    /// signal), the act's 30 s deadline otherwise. `KIMI_ALAB_TERM_GRACE_MS` bounds both.
+    fn for_event(event: &Restart, term_grace: Duration) -> Self {
+        let kill_after = if event.cause == "stall" {
+            STALL_KILL_AFTER.min(term_grace)
+        } else {
+            term_grace
+        };
+        Self {
+            cause: event.cause.clone(),
+            kill_after,
+            killed: false,
+        }
+    }
+}
+
+/// aterm's grace before a stalled program's `SIGKILL` (`crates/aterm-gui/src/input_stall.rs`
+/// `RESTART_GRACE`).
+const STALL_KILL_AFTER: Duration = Duration::from_secs(5);
+
+impl Moving {
+    /// How long after `sent` the child must have ended.
+    fn limit(&self, term_grace: Duration) -> Duration {
+        match &self.restart {
+            Some(escalation) if !escalation.killed => escalation.kill_after,
+            _ => term_grace,
+        }
+    }
+
+    /// Whether `status` is the end the harness's own signal gave the child, so the move or the
+    /// restart goes on.
+    fn ended_by_us(&self, status: Status) -> bool {
+        status.after_our_term()
+            || self
+                .restart
+                .as_ref()
+                .is_some_and(|escalation| escalation.killed && status == Status::Killed(SIGKILL))
+    }
 }
 
 /// A build a move just started: if it refuses to start within [`STARTUP_GRACE`], the harness
@@ -489,8 +590,60 @@ struct Moved {
     prev: Build,
     argv: Vec<String>,
     session: String,
-    account: Option<aterm::Account>,
+    account: Option<Account>,
     started: Instant,
+}
+
+/// A crash being answered: no child runs, and the harness waits for its next step.
+struct Crash {
+    /// How the child ended; the harness ends the same way when the crash is passed on.
+    status: Status,
+    /// The conversation the child last proved by its lock.
+    session: String,
+    /// The resume argv.
+    argv: Vec<String>,
+    /// When the back-off's pause is over.
+    due: Instant,
+    /// What the crash waits for now.
+    wait: CrashWait,
+    /// Time spent waiting for aterm to answer again, in all, for this crash.
+    budget: AwayBudget,
+    /// Why aterm did not answer, for the journal when the wait runs out.
+    away: String,
+}
+
+/// What a crash being answered waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrashWait {
+    /// The back-off's pause ([`Crash::due`]); aterm is asked again when it is over.
+    Pause,
+    /// aterm, which was away or answered `ERR`: asked again at this time, once the link is held.
+    Away(Instant),
+}
+
+/// What one step of a crash being answered decided.
+enum Tick {
+    /// Nothing yet.
+    Wait,
+    /// Start the same build on the conversation now.
+    Relaunch,
+    /// The crash is not answered with a relaunch; the reason.
+    PassOn(String),
+}
+
+/// A restart aterm asked for that waits: for the child's session lock, or for aterm to answer.
+/// It waits at most [`Settings::restart_wait`] from its arrival, whatever it waits for: a restart
+/// is made for the moment aterm asked in, and one made much later (the person's first prompt
+/// opening a session an hour on) would end the child mid-turn for a cause long gone. aterm asks
+/// again while its cause stands (a stall's remedy fires again).
+struct Deferred {
+    event: Restart,
+    /// When it is refused if it still waits.
+    expires: Instant,
+    /// When aterm is asked again.
+    next_ask: Instant,
+    /// Why it waits, journalled once.
+    why: String,
 }
 
 /// The exit code for a binary that could not be started.
@@ -584,36 +737,77 @@ fn refresh_session(cur: &mut Running, base: &Env, host: &str, journal: &mut Jour
     }
 }
 
+/// What aterm's restart request came to.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "made once and moved rarely; a Box would put every access behind a heap deref the Trust verifier fails closed on"
+)]
+enum Asked {
+    /// The child was sent `SIGTERM`; the restart is under way.
+    Moving(Moving),
+    /// It was refused, and journalled.
+    Refused,
+    /// It waits: for the child's session lock, or for aterm to answer.
+    Waits { why: String },
+}
+
+/// aterm asked the claim holder to restart its child (`restart cause=<cause>`): end the child
+/// with `SIGTERM` now (and `SIGKILL` if it does not end, [`Escalation`]), and resume the same
+/// session when it has ended. The request is aterm's, or a person's through aterm, so no safe
+/// point is waited for, and it is no crash.
+///
+/// It is made only when the child's lock has named its session, the resume argv can be written,
+/// the restart names no model, and one fresh policy and status read permits it
+/// (`alab_wire::relaunch::permitted` with `asked`): the claim is this harness's, proven and takes
+/// `relaunch`, the policy stands, and nobody holds the session (no halt, no other driver's
+/// hand). A request with no session yet, or one aterm could not answer, waits ([`Deferred`]).
 fn restart_now(
     cur: &Running,
-    claim: &mut Option<Claimed>,
-    event: &aterm::Restart,
+    link: &mut Link,
+    event: &Restart,
+    term_grace: Duration,
     journal: &mut Journal,
-) -> Option<Moving> {
-    let claimed = claim.as_mut()?;
-    if let Err(error) = claimed.relaunch_permitted() {
-        let why = match error {
-            SafePointError::Io(why) => format!("aterm's connection failed: {why}"),
-            SafePointError::Hold(why) => why,
-        };
-        journal.note("RESTART-REFUSED", &why);
-        return None;
-    }
+) -> Asked {
     let Some(session) = cur.session.clone() else {
-        journal.note(
-            "RESTART-REFUSED",
-            "no running child's session lock names the conversation",
-        );
-        return None;
+        return Asked::Waits {
+            why: "no running child's session lock names the conversation".to_string(),
+        };
     };
     let words = cur.words.clone().unwrap_or_default();
     let argv = match kimi::resume_argv(&words, &session) {
         Ok(argv) => argv,
         Err(why) => {
-            journal.note("RESTART-REFUSED", &why.to_string());
-            return None;
+            journal.note("RESTART-REFUSED", &format!("cause={} {why}", event.cause));
+            return Asked::Refused;
         }
     };
+    if let Some(model) = &event.model {
+        // Kimi Code would be started on the model it ran, which answers a model move with the
+        // model aterm moved it from. Choosing Kimi's model on a resume is not built yet.
+        journal.note(
+            "RESTART-REFUSED",
+            &format!(
+                "cause={} model={model}: {NAME} cannot yet start {} on a model aterm names",
+                event.cause,
+                kimi::COMMAND
+            ),
+        );
+        return Asked::Refused;
+    }
+    let word = link.relaunch_word(true, aterm::now_ms());
+    aterm::journal(link, journal);
+    match word {
+        Relaunch::Permitted => {}
+        Relaunch::Denied(why) => {
+            journal.note("RESTART-REFUSED", &format!("cause={} {why}", event.cause));
+            return Asked::Refused;
+        }
+        Relaunch::Away(why) | Relaunch::Later(why) => {
+            return Asked::Waits {
+                why: format!("aterm did not answer: {why}"),
+            };
+        }
+    }
     let to = event
         .account
         .as_ref()
@@ -623,17 +817,198 @@ fn restart_now(
         &format!("cause={}{to}: resuming session {session}", event.cause),
     );
     cur.signal(Signal::TERM);
-    Some(Moving {
+    Asked::Moving(Moving {
         argv,
         session,
         from: cur.build.version_label(),
         target: cur.build.clone(),
         account: event.account.clone().or_else(|| cur.account.clone()),
         sent: Instant::now(),
+        restart: Some(Escalation::for_event(event, term_grace)),
     })
 }
 
+/// A restart aterm asked for waited [`Settings::restart_wait`] and is refused: journal it with
+/// what it last waited for.
+fn restart_expired(waiting: &Deferred, why: &str, limit: Duration, journal: &mut Journal) {
+    journal.note(
+        "RESTART-REFUSED",
+        &format!(
+            "cause={} not made within {} ms: {why}",
+            waiting.event.cause,
+            limit.as_millis()
+        ),
+    );
+}
+
+/// A new child was started and is not announced yet: a restart aterm asked for until now was
+/// meant for the child before it, so it is passed over and never applied to this one, as
+/// `Link::events` says. That is one still waiting ([`Deferred`]), and one aterm sent as that
+/// child ended (read in the same wake as its end, or while the next child was being started)
+/// and not yet drained.
+fn pass_over_earlier(
+    cur: &Running,
+    link: &mut Link,
+    deferred: &mut Option<Deferred>,
+    journal: &mut Journal,
+) {
+    if let Some(waiting) = deferred.take() {
+        journal.note(
+            "RESTART-PASSED-OVER",
+            &format!(
+                "cause={} it waited for the child before this one",
+                waiting.event.cause
+            ),
+        );
+    }
+    let now = aterm::now_ms();
+    link.tick(cur.claim(), now);
+    let drained = link.events(cur.claim(), now);
+    aterm::journal(link, journal);
+    if let Some(event) = drained.restart {
+        journal.note(
+            "RESTART-PASSED-OVER",
+            &format!(
+                "cause={} it came before this child was announced",
+                event.cause
+            ),
+        );
+    }
+}
+
+/// Whether the child's end `status` is a crash the harness now answers: nobody passed it `HUP`
+/// or `TERM` (`ending`), the end is abnormal (`alab_wire::relaunch::abnormal_exit`), the session
+/// has a claim, the child's lock named its session, and the launch can be resumed. `Err(None)`
+/// for an end that is the session's own, `Err(Some(why))` for an abnormal end passed on.
+fn crash_begins(
+    status: Status,
+    cur: &Running,
+    link: &Link,
+    ending: Option<i32>,
+) -> Result<(String, Vec<String>), Option<String>> {
+    if ending.is_some() || !alab_wire::relaunch::abnormal_exit(status.end()) {
+        return Err(None);
+    }
+    if !link.claims() {
+        return Err(Some("no-claim".to_string()));
+    }
+    let Some(session) = cur.session.clone() else {
+        return Err(Some(
+            "no-session: the child's lock never named its conversation".to_string(),
+        ));
+    };
+    let words = cur.words.clone().unwrap_or_default();
+    let argv = kimi::resume_argv(&words, &session)
+        .map_err(|why| Some(format!("cannot resume session {session}: {why}")))?;
+    Ok((session, argv))
+}
+
+/// Ask aterm whether the crashed child may be brought back, and say what follows: a relaunch
+/// once the pause is over, a wait, or the crash passed on. aterm away or answering `ERR` is
+/// waited for, asked again every [`ASK_AGAIN`] once the link is held, within
+/// `alab_wire::relaunch::AWAY_BUDGET` of time actually spent waiting for this crash.
+fn crash_judged(crash: &mut Crash, link: &mut Link, journal: &mut Journal) -> Tick {
+    let now = Instant::now();
+    let ms = aterm::now_ms();
+    let word = link.relaunch_word(false, ms);
+    aterm::journal(link, journal);
+    match word {
+        Relaunch::Permitted => {
+            crash.budget.answered(ms);
+            if now >= crash.due {
+                Tick::Relaunch
+            } else {
+                crash.wait = CrashWait::Pause;
+                Tick::Wait
+            }
+        }
+        Relaunch::Denied(why) => Tick::PassOn(why),
+        Relaunch::Away(why) | Relaunch::Later(why) => {
+            if crash.budget.wait(ms) {
+                journal.note(
+                    "CRASH-WAIT",
+                    &format!("aterm did not answer ({why}); asking again within the 45 s budget"),
+                );
+            }
+            crash.away = why;
+            if crash.budget.spent(ms) {
+                return Tick::PassOn(format!("claim-not-proven-again {}", crash.away));
+            }
+            crash.wait = CrashWait::Away(now + ASK_AGAIN);
+            Tick::Wait
+        }
+    }
+}
+
+/// One step of a crash being answered, on every pass of the loop while no child runs. It
+/// never waits.
+fn crash_tick(crash: &mut Crash, link: &mut Link, journal: &mut Journal) -> Tick {
+    let now = Instant::now();
+    match crash.wait {
+        CrashWait::Pause if now < crash.due => Tick::Wait,
+        CrashWait::Away(next) if now < next || link.is_lost() => {
+            if crash.budget.spent(aterm::now_ms()) {
+                Tick::PassOn(format!("claim-not-proven-again {}", crash.away))
+            } else {
+                Tick::Wait
+            }
+        }
+        CrashWait::Pause | CrashWait::Away(_) => crash_judged(crash, link, journal),
+    }
+}
+
+/// aterm's word at a move's stop point: its whole safe point when it attested (`by_aterm`), and
+/// under a claim at least no halt, no other driver's hand and the claim still this harness's with
+/// the upgrade duty when a person attested by hand. A link that stops answering here holds the move, whoever
+/// attested; with no claim standing, a person's attestation stands on the harness's own readings.
+fn stop_point(link: &mut Link, by_aterm: bool, journal: &mut Journal) -> Result<(), String> {
+    let judged = link.judges();
+    let holder = link.config().holder(std::process::id());
+    let now = aterm::now_ms();
+    let word = match (judged, by_aterm) {
+        (false, true) => Err("aterm's claim was lost".to_string()),
+        (false, false) => Ok(()),
+        (true, true) => match link.safe_point(Duration::ZERO, now) {
+            Word::Safe => Ok(()),
+            Word::Hold(why) => Err(why),
+            Word::Local => Err("aterm's claim was lost".to_string()),
+        },
+        (true, false) => match link.read(now) {
+            Reading::Fresh(facts) => aterm::unheld(&facts, &holder),
+            Reading::Hold(why) => Err(why),
+            Reading::Local if link.is_lost() => Err("aterm's connection failed".to_string()),
+            Reading::Local => Ok(()),
+        },
+    };
+    aterm::journal(link, journal);
+    word
+}
+
+/// How soon aterm is asked again about a crash or an asked restart while it could not answer.
+const ASK_AGAIN: Duration = Duration::from_millis(LATER_RETRY_MS);
+
+/// The crash is not answered with a relaunch: journal why, drop whatever was typed at the dead
+/// screen (so a parent shell does not run it), and end as the child did.
+fn crash_passed_on(crash: &Crash, why: &str, journal: &mut Journal) -> Outcome {
+    journal.note(
+        "CRASH-PASSED-ON",
+        &format!("{why} (the child ended: {})", crash.status),
+    );
+    tty::discard_input();
+    crash.status.outcome()
+}
+
+/// The signals that end the harness while no child runs: whoever sends them wants the session
+/// over, and a relaunch would fight them.
+const fn ends_a_crash(sig: i32) -> bool {
+    matches!(sig, SIGINT | SIGQUIT | SIGHUP | SIGTERM)
+}
+
 /// How the supervisor obtains its vendor child.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "made once and moved rarely; a Box would put every access behind a heap deref the Trust verifier fails closed on"
+)]
 pub enum Start {
     /// Spawn this build as a new child.
     Fresh(Build),
@@ -647,7 +1022,7 @@ pub fn run(
     settings: &Settings,
     start: Start,
     launch: &[OsString],
-    claim: Option<Claimed>,
+    link: Link,
     journal: &mut Journal,
 ) -> Outcome {
     let mut signals = match Signals::install() {
@@ -658,11 +1033,11 @@ pub fn run(
         }
     };
     let modes = tty::Modes::save();
-    let (mut cur, mut crash_relaunched, mut abandoned, event) = match start {
+    let (mut cur, mut ladder, mut abandoned, event) = match start {
         Start::Fresh(first) => {
             let exe = first.exe.clone();
             match Running::start(first, launch, settings.depth, None) {
-                Ok(running) => (running, false, BTreeSet::new(), "START"),
+                Ok(running) => (running, Ladder::new(), BTreeSet::new(), "START"),
                 Err(e) => {
                     say(&format!("cannot run {}: {e}", exe.display()));
                     return Outcome::Exit(spawn_failure_code(&e));
@@ -670,10 +1045,10 @@ pub fn run(
             }
         }
         Start::Adopt(state) => {
-            let crash_relaunched = state.crash_relaunched;
+            let ladder = Ladder::carried(state.crash_streak, state.crash_since, aterm::now_ms());
             let abandoned = state.abandoned.clone();
             match Running::adopt(state, launch) {
-                Ok(running) => (running, crash_relaunched, abandoned, "ADOPT"),
+                Ok(running) => (running, ladder, abandoned, "ADOPT"),
                 Err(why) => {
                     journal.note("ADOPT-FAILED", &why);
                     say(&format!("cannot adopt the running child: {why}"));
@@ -695,23 +1070,22 @@ pub fn run(
     );
     let host = hostname();
     let knobs = settings.knobs;
-    let adopted = event == "ADOPT";
-    let mut claim = claim;
-    let claim_locator = claim
-        .as_ref()
-        .map(|claimed| claimed.locator.clone())
-        .or_else(|| {
-            adopted
-                .then(|| aterm::Locator::from_env(&settings.env).ok())
-                .flatten()
-        });
+    let mut link = link;
+    let mut deferred: Option<Deferred> = None;
+    if event == "START" {
+        // The claim was made before the child existed; name it now (`child=` under contract 4).
+        // An adopted child was named in its claim already.
+        pass_over_earlier(&cur, &mut link, &mut deferred, journal);
+        link.reannounce(cur.claim(), aterm::now_ms());
+        aterm::journal(&mut link, journal);
+    }
     let mut claim_tick = Instant::now()
         .checked_sub(settings.poll)
         .unwrap_or_else(Instant::now);
-    let mut reclaim_at = Instant::now();
     let mut aterm_attest = false;
     let mut moving: Option<Moving> = None;
     let mut moved: Option<Moved> = None;
+    let mut crash: Option<Crash> = None;
     let mut pending: Option<Build> = None;
     let own_id = own_build_id().or_else(|| store::current_id(&settings.prefix, NAME));
     let mut own_pending: Option<Build> = None;
@@ -722,11 +1096,73 @@ pub fn run(
     let mut attest: Option<Attestation> = None;
     let mut window: Option<Probe> = None;
     let mut ending: Option<i32> = None;
-    let mut deferred_restart: Option<aterm::Restart> = None;
 
     loop {
         signals.wait(settings.poll);
-        for sig in signals.take() {
+        let caught = signals.take();
+
+        // A crash being answered: no child runs.
+        if let Some(answering) = crash.as_mut() {
+            if let Some(sig) = caught.iter().copied().find(|sig| ends_a_crash(*sig)) {
+                return crash_passed_on(answering, &format!("signal {sig}"), journal);
+            }
+            link.tick(cur.claim(), aterm::now_ms());
+            let drained = link.events(cur.claim(), aterm::now_ms());
+            aterm::journal(&mut link, journal);
+            if let Some(event) = drained.restart {
+                journal.note(
+                    "RESTART-REFUSED",
+                    &format!("cause={} crash-pending: no child runs", event.cause),
+                );
+            }
+            match crash_tick(answering, &mut link, journal) {
+                Tick::Wait => continue,
+                Tick::PassOn(why) => return crash_passed_on(answering, &why, journal),
+                Tick::Relaunch => {}
+            }
+            // A signal caught since the last look still stops the relaunch it was sent to stop.
+            if let Some(sig) = signals.take().into_iter().find(|sig| ends_a_crash(*sig)) {
+                return crash_passed_on(answering, &format!("signal {sig}"), journal);
+            }
+            tty::discard_input();
+            modes.restore();
+            let streak = ladder.streak().saturating_add(1);
+            journal.note(
+                "CRASH-RELAUNCH",
+                &format!(
+                    "resuming session {} after {} streak={streak}",
+                    answering.session, answering.status
+                ),
+            );
+            let mv = Moving {
+                argv: answering.argv.clone(),
+                session: answering.session.clone(),
+                from: cur.build.version_label(),
+                target: cur.build.clone(),
+                account: cur.account.clone(),
+                sent: Instant::now(),
+                restart: None,
+            };
+            match relaunch(settings, &cur, &mv, true, &mut abandoned, journal) {
+                Ok(next) => {
+                    ladder.relaunched(aterm::now_ms());
+                    cur = next;
+                    pass_over_earlier(&cur, &mut link, &mut deferred, journal);
+                    link.reannounce(cur.claim(), aterm::now_ms());
+                    aterm::journal(&mut link, journal);
+                    crash = None;
+                    pending = None;
+                    attest = None;
+                    aterm_attest = false;
+                    window = None;
+                    noted_refusal = false;
+                    continue;
+                }
+                Err(outcome) => return outcome,
+            }
+        }
+
+        for sig in caught {
             match sig {
                 SIGHUP | SIGTERM => {
                     ending.get_or_insert(sig);
@@ -763,52 +1199,31 @@ pub fn run(
             }
         }
 
-        if moving.is_none() && ending.is_none() {
-            let drained = claim
-                .as_mut()
-                .and_then(|claimed| claimed.events.as_mut().map(aterm::Events::drain));
-            match drained {
-                Some(Ok(events)) => {
-                    if let Some(event) = events.restart {
-                        moving = restart_now(&cur, &mut claim, &event, journal);
-                        if moving.is_some() {
-                            deferred_restart = None;
-                            pending = None;
-                            attest = None;
-                            aterm_attest = false;
-                            window = None;
-                        } else if cur.session.is_none() {
-                            deferred_restart = Some(event);
-                        }
-                    }
-                }
-                Some(Err(why)) => {
-                    journal.note("EVENT-LOST", &why.to_string());
-                    if let Some(claimed) = claim.as_mut() {
-                        claimed.events = None;
-                        reclaim_at = Instant::now() + Duration::from_secs(5);
-                    }
-                }
-                None => {}
-            }
-            if let Some(claimed) = claim.as_mut()
-                && claimed.events.is_none()
-                && Instant::now() >= reclaim_at
-                && let Ok(sock) = claimed.locator.sock()
-            {
-                claimed.events =
-                    aterm::Events::open(&sock, &claimed.locator.sid, aterm::TIMEOUT).ok();
-            }
-        }
-
+        // The child first: an end already read is never mistaken for a running child below.
         let reaped = reap(cur.pid);
-        let still_running = matches!(reaped, Reap::Running);
+        let still_running = matches!(reaped, Reap::Running | Reap::Continued);
         match reaped {
             Reap::Running => {}
+            Reap::Continued => {
+                // Time the child spent stopped is not time it had to act on a signal, whoever
+                // stopped it: the grace of a SIGTERM or SIGKILL sent starts again.
+                if let Some(mv) = moving.as_mut() {
+                    mv.sent = Instant::now();
+                    journal.note(
+                        "CONTINUED",
+                        "the child was continued; the grace of the signal sent starts again",
+                    );
+                }
+            }
             Reap::Stopped => {
                 journal.note("STOP", "the child stopped; the harness stops with it");
                 let _ = signal_hook::low_level::raise(SIGTSTP);
                 cur.signal(Signal::CONT);
+                // A stopped child acts on no signal but SIGKILL, so its time stopped is not
+                // time it had to end: the grace of a SIGTERM or SIGKILL sent starts again.
+                if let Some(mv) = moving.as_mut() {
+                    mv.sent = Instant::now();
+                }
                 journal.note("CONT", "continued; the child is continued too");
                 continue;
             }
@@ -842,6 +1257,7 @@ pub fn run(
                             target: jm.prev,
                             account: jm.account,
                             sent: jm.started,
+                            restart: None,
                         };
                         match relaunch(settings, &cur, &back, true, &mut abandoned, journal) {
                             Ok(next) => {
@@ -852,8 +1268,10 @@ pub fn run(
                                     account: cur.account.clone(),
                                     started: Instant::now(),
                                 });
-                                reannounce(&mut claim, &next, journal);
                                 cur = next;
+                                pass_over_earlier(&cur, &mut link, &mut deferred, journal);
+                                link.reannounce(cur.claim(), aterm::now_ms());
+                                aterm::journal(&mut link, journal);
                                 pending = None;
                                 attest = None;
                                 aterm_attest = false;
@@ -864,74 +1282,55 @@ pub fn run(
                             Err(outcome) => return outcome,
                         }
                     }
-                    if ending.is_none()
-                        && status.refused_start()
-                        && !crash_relaunched
-                        && let Some(session) = cur.session.clone()
-                    {
-                        let permitted = claim.as_mut().map_or_else(
-                            || Err("this harness holds no aterm relaunch claim".to_string()),
-                            |claimed| {
-                                claimed.relaunch_permitted().map_err(|error| match error {
-                                    SafePointError::Io(why) => {
-                                        format!("aterm's connection failed: {why}")
-                                    }
-                                    SafePointError::Hold(why) => why,
-                                })
-                            },
-                        );
-                        match permitted {
-                            Ok(()) => {
-                                let words = cur.words.clone().unwrap_or_default();
-                                match kimi::resume_argv(&words, &session) {
-                                    Ok(argv) => {
-                                        journal.note(
-                                            "CRASH-RELAUNCH",
-                                            &format!("resuming session {session} after {status}"),
-                                        );
-                                        modes.restore();
-                                        let mv = Moving {
-                                            argv,
-                                            session,
-                                            from: cur.build.version_label(),
-                                            target: cur.build.clone(),
-                                            account: cur.account.clone(),
-                                            sent: Instant::now(),
-                                        };
-                                        match relaunch(
-                                            settings,
-                                            &cur,
-                                            &mv,
-                                            true,
-                                            &mut abandoned,
-                                            journal,
-                                        ) {
-                                            Ok(next) => {
-                                                crash_relaunched = true;
-                                                reannounce(&mut claim, &next, journal);
-                                                cur = next;
-                                                pending = None;
-                                                attest = None;
-                                                aterm_attest = false;
-                                                window = None;
-                                                noted_refusal = false;
-                                                continue;
-                                            }
-                                            Err(outcome) => return outcome,
-                                        }
-                                    }
-                                    Err(why) => journal.note(
-                                        "RELAUNCH-REFUSED",
-                                        &format!("cannot resume session {session}: {why}"),
-                                    ),
-                                }
-                            }
-                            Err(why) => journal.note("RELAUNCH-REFUSED", &why),
+                    let (session, argv) = match crash_begins(status, &cur, &link, ending) {
+                        Ok(found) => found,
+                        Err(None) => return status.outcome(),
+                        Err(Some(why)) => {
+                            journal.note("CRASH-PASSED-ON", &format!("{why} ({status})"));
+                            return status.outcome();
                         }
+                    };
+                    // The crashed child left the terminal in its own modes, in which a key
+                    // sends no signal: put the harness's back at once, so Ctrl-C reaches the
+                    // harness for as long as no child runs.
+                    modes.restore();
+                    tty::release_keyboard();
+                    if let Some(waiting) = deferred.take() {
+                        journal.note(
+                            "RESTART-REFUSED",
+                            &format!("cause={} child-ended", waiting.event.cause),
+                        );
                     }
-                    return status.outcome();
+                    let now = Instant::now();
+                    let pause = ladder.crashed(aterm::now_ms());
+                    journal.note(
+                        "CRASH",
+                        &format!(
+                            "{status}: session {session} streak={} pause-ms={}",
+                            ladder.streak(),
+                            pause.as_millis()
+                        ),
+                    );
+                    let mut answering = Crash {
+                        status,
+                        session,
+                        argv,
+                        due: now + pause,
+                        wait: CrashWait::Pause,
+                        budget: AwayBudget::new(),
+                        away: String::new(),
+                    };
+                    match crash_judged(&mut answering, &mut link, journal) {
+                        Tick::PassOn(why) => return crash_passed_on(&answering, &why, journal),
+                        Tick::Wait | Tick::Relaunch => {}
+                    }
+                    crash = Some(answering);
+                    attest = None;
+                    aterm_attest = false;
+                    window = None;
+                    continue;
                 };
-                if ending.is_some() || !status.after_our_term() {
+                if ending.is_some() || !mv.ended_by_us(status) {
                     say(&format!(
                         "{} ended ({status}) while being moved to a new build; resume it with: {} -r {}",
                         kimi::COMMAND,
@@ -950,8 +1349,10 @@ pub fn run(
                             account: cur.account.clone(),
                             started: Instant::now(),
                         });
-                        reannounce(&mut claim, &next, journal);
                         cur = next;
+                        pass_over_earlier(&cur, &mut link, &mut deferred, journal);
+                        link.reannounce(cur.claim(), aterm::now_ms());
+                        aterm::journal(&mut link, journal);
                         pending = None;
                         attest = None;
                         aterm_attest = false;
@@ -966,43 +1367,114 @@ pub fn run(
 
         if still_running {
             refresh_session(&mut cur, &settings.env, &host, journal);
-            if cur.started.elapsed() > STARTUP_GRACE {
-                crash_relaunched = false;
+        }
+
+        link.tick(cur.claim(), aterm::now_ms());
+        let drained = link.events(cur.claim(), aterm::now_ms());
+        aterm::journal(&mut link, journal);
+        if moving.is_none() && ending.is_none() {
+            let asked = drained.restart.map(|event| Deferred {
+                event,
+                expires: Instant::now() + settings.restart_wait,
+                next_ask: Instant::now(),
+                why: String::new(),
+            });
+            if asked.is_some() {
+                deferred = asked;
+            }
+            let now = Instant::now();
+            let due = deferred
+                .as_ref()
+                .is_some_and(|waiting| now >= waiting.next_ask);
+            if due && let Some(mut waiting) = deferred.take() {
+                match restart_now(
+                    &cur,
+                    &mut link,
+                    &waiting.event,
+                    settings.term_grace,
+                    journal,
+                ) {
+                    Asked::Moving(mv) => {
+                        moving = Some(mv);
+                        pending = None;
+                        attest = None;
+                        aterm_attest = false;
+                        window = None;
+                    }
+                    Asked::Refused => {}
+                    Asked::Waits { why } => {
+                        if now >= waiting.expires {
+                            restart_expired(&waiting, &why, settings.restart_wait, journal);
+                        } else {
+                            if waiting.why != why {
+                                journal.note(
+                                    "RESTART-WAITS",
+                                    &format!("cause={} {why}", waiting.event.cause),
+                                );
+                                waiting.why = why;
+                            }
+                            waiting.next_ask = now + ASK_AGAIN;
+                            deferred = Some(waiting);
+                        }
+                    }
+                }
+            } else if let Some(waiting) = deferred.as_ref()
+                && now >= waiting.expires
+            {
+                restart_expired(waiting, &waiting.why, settings.restart_wait, journal);
+                deferred = None;
             }
         }
 
-        if still_running
-            && moving.is_none()
-            && ending.is_none()
-            && cur.session.is_some()
-            && let Some(event) = deferred_restart.take()
+        if let Some(mv) = moving.as_mut()
+            && mv.sent.elapsed() > mv.limit(settings.term_grace)
         {
-            moving = restart_now(&cur, &mut claim, &event, journal);
-            if moving.is_some() {
-                pending = None;
-                attest = None;
-                aterm_attest = false;
-                window = None;
+            match mv.restart.as_mut() {
+                Some(escalation) if !escalation.killed => {
+                    journal.note(
+                        "RESTART-KILL",
+                        &format!(
+                            "cause={} {} pid {} did not end within {} ms of SIGTERM; SIGKILL",
+                            escalation.cause,
+                            kimi::COMMAND,
+                            cur.pid.as_raw_nonzero(),
+                            escalation.kill_after.as_millis()
+                        ),
+                    );
+                    cur.signal(Signal::KILL);
+                    escalation.killed = true;
+                    mv.sent = Instant::now();
+                }
+                Some(escalation) => {
+                    journal.note(
+                        "RESTART-ABANDONED",
+                        &format!(
+                            "cause={} {} pid {} still runs {} ms after SIGKILL",
+                            escalation.cause,
+                            kimi::COMMAND,
+                            cur.pid.as_raw_nonzero(),
+                            settings.term_grace.as_millis()
+                        ),
+                    );
+                    moving = None;
+                }
+                None => {
+                    journal.note(
+                        "MOVE-ABANDONED",
+                        &format!(
+                            "{} pid {} did not end within {} ms of SIGTERM; the move onto {} is abandoned and not tried again",
+                            kimi::COMMAND,
+                            cur.pid.as_raw_nonzero(),
+                            settings.term_grace.as_millis(),
+                            mv.target.version_label()
+                        ),
+                    );
+                    abandoned.insert(mv.target.id);
+                    moving = None;
+                    pending = None;
+                    window = None;
+                }
             }
-        }
-
-        if let Some(mv) = &moving
-            && mv.sent.elapsed() > settings.term_grace
-        {
-            journal.note(
-                "MOVE-ABANDONED",
-                &format!(
-                    "{} pid {} did not end within {} ms of SIGTERM; the move onto {} is abandoned and not tried again",
-                    kimi::COMMAND,
-                    cur.pid.as_raw_nonzero(),
-                    settings.term_grace.as_millis(),
-                    mv.target.version_label()
-                ),
-            );
-            abandoned.insert(mv.target.id);
-            moving = None;
-            pending = None;
-            window = None;
         }
 
         if moving.is_some() || ending.is_some() || settings.no_update {
@@ -1056,13 +1528,12 @@ pub fn run(
                     }
                 }
             }
-            Some(_) => {
-                if pending.take().is_some() {
-                    journal.note("UPDATE-WITHDRAWN", "the running build is current again");
-                    window = None;
-                }
+            Some(_) if pending.is_some() => {
+                pending = None;
+                journal.note("UPDATE-WITHDRAWN", "the running build is current again");
+                window = None;
             }
-            None => {}
+            Some(_) | None => {}
         }
         match store::current_id(&settings.prefix, NAME) {
             Some(id) if Some(id) != own_id && !own_abandoned.contains(&id) => {
@@ -1089,18 +1560,17 @@ pub fn run(
                     }
                 }
             }
-            Some(_) => {
-                if own_pending.take().is_some() {
-                    journal.note(
-                        "SELF-UPDATE-WITHDRAWN",
-                        "the running image is current again",
-                    );
-                    window = None;
-                }
+            Some(_) if own_pending.is_some() => {
+                own_pending = None;
+                journal.note(
+                    "SELF-UPDATE-WITHDRAWN",
+                    "the running image is current again",
+                );
+                window = None;
             }
-            None => {}
+            Some(_) | None => {}
         }
-        if pending.is_none() && own_pending.is_none() && !(adopted && claim.is_none()) {
+        if pending.is_none() && own_pending.is_none() {
             continue;
         }
         if pending.is_some()
@@ -1118,45 +1588,24 @@ pub fn run(
 
         if claim_tick.elapsed() >= settings.poll {
             claim_tick = Instant::now();
-            match claim.as_mut().map(Claimed::safe_point) {
-                Some(Ok(_)) if attest.is_none() => {
+            let word = link
+                .judges()
+                .then(|| link.safe_point(Duration::ZERO, aterm::now_ms()));
+            aterm::journal(&mut link, journal);
+            match word {
+                Some(Word::Safe) if attest.is_none() => {
                     attest = Some(Attestation::now());
                     aterm_attest = true;
                     window = None;
                     journal.note("ATTEST", "aterm attested an idle, empty, unheld session");
                 }
-                Some(Err(SafePointError::Io(why))) => {
-                    journal.note("UNCLAIMED", &format!("aterm's connection failed: {why}"));
-                    claim = None;
-                    reclaim_at = Instant::now() + Duration::from_secs(5);
-                    if aterm_attest {
-                        attest = None;
-                        aterm_attest = false;
-                        window = None;
-                    }
+                // The link was lost or given back: an attestation aterm made no longer stands.
+                Some(Word::Local) if aterm_attest => {
+                    attest = None;
+                    aterm_attest = false;
+                    window = None;
                 }
-                None if Instant::now() >= reclaim_at => {
-                    if let Some(locator) = &claim_locator {
-                        match aterm::claim(
-                            locator,
-                            std::process::id(),
-                            crate::cli::VERSION,
-                            cur.build.version.as_deref(),
-                            cur.account.as_ref().map(|account| account.label.as_str()),
-                            aterm::TIMEOUT,
-                        ) {
-                            Ok(claimed) => {
-                                journal.note("CLAIMED", "aterm's upgrade claim was re-proven");
-                                claim = Some(claimed);
-                            }
-                            Err(why) => {
-                                reclaim_at = Instant::now() + Duration::from_secs(5);
-                                journal.note("UNCLAIMED", &why);
-                            }
-                        }
-                    }
-                }
-                Some(Ok(_) | Err(SafePointError::Hold(_))) | None => {}
+                Some(Word::Safe | Word::Hold(_) | Word::Local) | None => {}
             }
         }
 
@@ -1189,24 +1638,10 @@ pub fn run(
                 window = None;
             }
             Verdict::Safe => {
-                let host_check = if aterm_attest {
-                    claim.as_mut().map_or_else(
-                        || Err("aterm's claim was lost".to_string()),
-                        |claimed| {
-                            claimed
-                                .safe_point()
-                                .map(|_| ())
-                                .map_err(|error| match error {
-                                    SafePointError::Io(why) => {
-                                        format!("aterm's connection failed: {why}")
-                                    }
-                                    SafePointError::Hold(why) => why,
-                                })
-                        },
-                    )
-                } else {
-                    Ok(())
-                };
+                // aterm's word at the stop point: its whole safe point when it attested, and
+                // under a claim at least no halt, no other driver's hand and the upgrade duty
+                // granted when a person did.
+                let host_check = stop_point(&mut link, aterm_attest, journal);
                 if let Some(target) = own_pending.clone().filter(|_| moved.is_none()) {
                     match host_check {
                         Ok(()) => {
@@ -1216,7 +1651,8 @@ pub fn run(
                                 session: cur.session.clone(),
                                 account: cur.account.clone(),
                                 started_for: cur.started.elapsed(),
-                                crash_relaunched,
+                                crash_streak: ladder.streak(),
+                                crash_since: ladder.since(aterm::now_ms()),
                                 abandoned: abandoned.clone(),
                                 identity: cur.handoff_identity(),
                             };
@@ -1278,6 +1714,7 @@ pub fn run(
                                 target: target.clone(),
                                 account: cur.account.clone(),
                                 sent: Instant::now(),
+                                restart: None,
                             });
                             cur.signal(Signal::TERM);
                         }
@@ -1292,27 +1729,6 @@ pub fn run(
                 window = None;
             }
         }
-    }
-}
-
-fn reannounce(claim: &mut Option<Claimed>, running: &Running, journal: &mut Journal) {
-    let Some(claimed) = claim.as_mut() else {
-        return;
-    };
-    if let Err(why) = claimed.reclaim(
-        std::process::id(),
-        crate::cli::VERSION,
-        running.build.version.as_deref(),
-        running
-            .account
-            .as_ref()
-            .map(|account| account.label.as_str()),
-    ) {
-        journal.note(
-            "UNCLAIMED",
-            &format!("the new vendor version could not be announced: {why}"),
-        );
-        *claim = None;
     }
 }
 
@@ -1471,15 +1887,26 @@ mod tests {
             ("KIMI_ALAB_ATTEST_MS", "5000"),
             ("KIMI_ALAB_POLL_MS", "1"),
             ("KIMI_ALAB_TERM_GRACE_MS", "50"),
+            ("KIMI_ALAB_RESTART_WAIT_MS", "1500"),
         ]);
         let s = Settings::from_env("/p".into(), env, false, 0);
         assert_eq!(s.knobs.quiet, Duration::from_millis(300));
         assert_eq!(s.knobs.attest_valid, Duration::from_secs(5));
         assert_eq!(s.poll, Duration::from_millis(20));
         assert_eq!(s.term_grace, Duration::from_millis(100));
+        assert_eq!(s.restart_wait, Duration::from_millis(1500));
+        let s = Settings::from_env(
+            "/p".into(),
+            Env::from_pairs([("KIMI_ALAB_RESTART_WAIT_MS", "18446744073709551615")]),
+            false,
+            0,
+        );
+        assert_eq!(s.restart_wait, Duration::from_secs(3600));
         let s = Settings::from_env("/p".into(), Env::default(), true, 3);
         assert_eq!(s.knobs, Knobs::defaults());
         assert_eq!(s.term_grace, Duration::from_secs(30));
+        assert_eq!(s.restart_wait, AWAY_BUDGET);
+        assert_eq!(AWAY_BUDGET, Duration::from_secs(45));
         assert!(s.no_update);
         assert_eq!(s.depth, 3);
     }
